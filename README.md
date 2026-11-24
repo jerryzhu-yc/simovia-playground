@@ -1,51 +1,38 @@
-# Simovia Playground
+# SmolVLA 策略闭环评测（SO-101）
 
-**每个分支 = 一个可独立复现的机器人 demo。** 本仓库是 [Simovia](https://github.com/jerryzhu-yc/simovia) 的演示场：`main` 分支放索引，其余分支各携带一个 demo 的世界文件、控制器脚本与详细复现流程，全部开箱即跑（机器人模型资产 `models/zoo/` 随仓库自带，无需联网下载）。
+> Simovia Playground 分支 `demo/so101-policy-eval`。两路相机 + 语言指令输入，SmolVLA 按 chunk 输出关节目标，31.25Hz 闭环驱动 SO-101 分拣红蓝方块入盒。提供 **sim**（世界内推理）与 **sim2sim**（离线动作序列回放）两种模式。
 
-## Demo 分支索引
+## 看点
 
-| 分支 | Demo | 一句话介绍 |
-|---|---|---|
-| `demo/lidar-nav-3d` | 3D 多线雷达建图 + 全屋覆盖清扫 | 16 线 960 束/帧 3D 雷达建出 RViz 风格彩虹点云，规划蛇形全覆盖路径把整间房拖一遍再回充 |
-| `demo/lidar-nav-2d` | 2D 雷达建图 + 骨架导航 | 60 束平面激光 log-odds 建图，维诺骨架 + A* + 纯跟踪驶向目标 |
-| `demo/pick-cube` | Panda 抓取 | 2FG7 夹爪相位机抓方块：接近-下探-闭合-抬升-入成功区 |
-| `demo/rrp3-ik` | RRP 三轴臂 DH 逆运动学 | DH 表造的 RRP 机械臂，解析 IK 写关节目标走轨迹 |
-| `demo/so101-sort` | SO-101 分拣 | SO-ARM100 家族桌面分拣：识别红色方块夹入框 |
-| `demo/so101-policy-eval` | SmolVLA 策略闭环 | 双相机 + 语言指令驱动 SO-101，31.25Hz chunk 推理（sim / sim2sim 双模式） |
-| `demo/g1-cloth` | G1 收拾毛毯遥操作 | PICO 手柄遥操作 G1 + 2F85 抓毯入盒，LeRobot 数据集采集/增强/回放/策略评测 |
-| `demo/cloth-folding` | G1 叠毛毯 | G1 全身关节策略叠桌上的毛毯 |
-| `demo/fruit-sorting` | 视觉水果分拣 | 腕部 RGB + HSV 分割 + 手眼标定反投影，香蕉/苹果/葡萄分类入框（6/6） |
-| `demo/hand-eye` | 独立手眼标定 | AXB 手眼标定全流程：采样-求解-验证-落盘复用 |
-| `demo/maintenance-relay` | 三机协同维修 | Go2 × G1 × UR5e 接力：UR5e 装模块 → Go2 运输 → G1 装入导向槽按复位键 |
-| `demo/diy-arm` | 自制连杆树机械臂 | YAML 连杆树从零造 RRP 臂 + 实时矩阵/位姿打印教学 |
+- **视觉-语言-动作闭环**：`cam_top` / `cam_left_wrist` 相机流 + 自然语言指令 → SmolVLA → chunk 关节目标，输出频率 31.25Hz。
+- **成功判定独立**：控制器判定两块都入盒且释放后稳定保持 `success=true`；任务 zone 由内核另行校验。
+- **sim2sim 回放**：`worlds/so101_policy_eval_sim2sim.yaml` 吃录制好的动作序列逐 tick 重放，用于隔离"策略输出"与"仿真环境"两侧的回归。
 
-## 通用复现流程（任意分支）
+## 文件
+
+| 文件 | 说明 |
+|---|---|
+| `worlds/so101_policy_eval.yaml` | 世界：SO-101 + 双相机 + 红蓝方块 + 成功 zone |
+| `worlds/so101_policy_eval_sim2sim.yaml` | sim2sim 动作回放世界 |
+| `controllers/so101_policy_eval.py` | 策略推理控制器（两模式共用） |
+
+## 复现流程
 
 ```bash
-# 1) 克隆并切到目标 demo 分支
-git clone https://github.com/jerryzhu-yc/simovia-playground.git
-cd simovia-playground
-git checkout demo/lidar-nav-3d          # ← 换成你想跑的分支
-
-# 2) 建 Python 3.11+ 虚拟环境并装依赖
+git checkout demo/so101-policy-eval
 python3.12 -m venv .venv && source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt          # 视觉 demo 另装 demo/fruit_sorting/requirements.txt
-
-# 3) 环境自检（依赖/模型资产/离屏渲染/样例世界编译）
+python -m pip install -r requirements.txt
 python -m simovia doctor
 
-# 4) 无头跑一遍（CI 同款）
-python -m simovia run worlds/<该分支的世界>.yaml
-
-# 5) 桌面 GUI 可视化（3D 视口 + 雷达建图 + 3D 点云等面板）
-python -m simovia gui     # 打开 worlds/<世界>.yaml → 运行
-```
-
-各分支根目录的 `README.md` 有该 demo 的详细说明、参数表与排障提示。平台本身的完整文档（世界文件格式、控制器 API、MCP、GUI、RL 接口）见 [simovia 主仓库](https://github.com/jerryzhu-yc/simovia)。
-
-## 测试
-
-```bash
+python -m simovia run worlds/so101_policy_eval.yaml            # sim 推理模式
+python -m simovia run worlds/so101_policy_eval_sim2sim.yaml    # sim2sim 回放模式
+python -m simovia gui
 python -m pytest tests/ -q
 ```
+
+> 推理模式需要本机部署的推理服务（模型权重与端点配置见主仓库 README 的 SmolVLA 章节）；sim2sim 模式无需权重即可跑通物理链路。
+
+## 常见问题
+
+- **策略不收敛/方块掉盒外**：先跑 sim2sim 确认物理链路正常，再查推理端 chunk 频率与指令文本拼写。
+- **相机流黑屏**：离屏渲染需 `python -m simovia doctor` 里「离屏渲染」项为 OK。
