@@ -1,0 +1,45 @@
+name: twin_arms                # 双 Franka Panda + 2FG7：多机器人演示/RL 动作空间
+timestep: 0.002
+ctrl_period: 32
+gravity: [0, 0, -9.81]
+integrator: implicitfast
+impratio: 10
+
+scene:
+  floor: {size: [2.0, 2.0], texture: grid}
+  lights:
+    - {pos: [0, 0, 3]}
+  objects:
+    - name: cube_a
+      type: box
+      size: [0.05, 0.05, 0.05]
+      pos: [0.25, 0.15, 0.051]
+      mass: 0.1
+      color: "#F59E0B"
+    - name: cube_b
+      type: box
+      size: [0.05, 0.05, 0.05]
+      pos: [0.85, 0.15, 0.051]
+      mass: 0.1
+      color: "#3B82F6"
+
+robots:
+  - name: arm_a
+    model: zoo://franka_emika_panda
+    pos: [0, 0, 0]
+    end_effectors: [{model: onrobot_2fg7}]
+  - name: arm_b
+    model: zoo://franka_emika_panda
+    pos: [0.6, 0, 0]
+    end_effectors: [{model: onrobot_2fg7}]
+
+task:
+  reward:
+    - distance: {a: cube_a, b: arm_a/link7, weight: -1.0}
+    - distance: {a: cube_b, b: arm_b/link7, weight: -1.0}
+  max_ticks: 3000
+
+runtime:
+  realtime: false
+  controller_timeout: 100
+  timeout_policy: last_ctrl

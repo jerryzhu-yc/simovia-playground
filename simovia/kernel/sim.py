@@ -1,0 +1,917 @@
+"""仿真内核：ZMQ ROUTER + 控制器子进程 + 栅栏同步推进。
+
+架构（方案 5.2 节）：
+- 每个机器人的控制器是独立 OS 进程，REQ 连内核 ROUTER
+- 控制器发 step 请求 -> 内核等所有活跃控制器的请求到齐（栅栏）
+  -> 写控制量 -> 推进 n*ctrl_period 个物理步 -> 各自回观测
+- 超时策略：last_ctrl=用上次控制量补位继续推进；pause=原地等待
+- 控制器崩溃（进程退出）：标记 inactive，内核按策略继续，永不死锁
+
+REQ/REP 严格锁步保证：每个 step 请求有且只有一个回复（obs 或 stop）。
+"""
+from __future__ import annotations
+
+import json
+import math
+import os
+import pathlib
+import subprocess
+import sys
+import threading
+import time
+
+import mujoco
+import numpy as np
+import zmq
+
+from simovia import supervisor
+from simovia.errors import WorldError
+from simovia.kernel.task import (obs_layout, robot_obs, root_freejoint_qadr,
+                                  sensors_obs, task_reward, task_success,
+                                  lidar_scan, lidar_pose, lidar_frame)
+from simovia.kernel.mapping import LidarMapper, PointCloudMapper
+from simovia.world.builder import build_world, resolve_task
+from simovia.world.schema import WorldSpec, world_to_dict
+
+# 控制器握手超时（秒）。spawn 后进程活着但迟迟不发 hello——典型如
+# Windows 上控制器 import/模型加载卡死——超过此时长放弃等待并报错，
+# 否则 run() 永久挂起（GUI 表现为"无仿真、无法停止、没有 tick"）。
+# 测试可 monkeypatch 本常量缩短等待。
+_HANDSHAKE_TIMEOUT = 30.0
+
+# 实时模式下观测子步采样的目标频率（Hz）。一个控制 tick 往往跨数十个物理步
+# （如 pick_cube：32 步 × 2ms = 64ms），若只在 tick 边界出画面，GUI 最多
+# 15.6 帧/秒且帧间是"跳"的。这里按物理子步（约 1/60 s 仿真时间）切片，
+# 让实时播放真正达到 60Hz 的画面更新。
+_SAMPLE_HZ = 60.0
+
+# 名字驱动的关节观测元数据：GUI 观测面板按关节逐个展示时标注类型/单位，
+# 不再假设"qpos 第 i 项 = ctrl 第 i 项"（球关节、被动关节、耦合夹爪都会
+# 打破这个下标对应关系）。
+_JOINT_TYPE_NAMES = {
+    int(mujoco.mjtJoint.mjJNT_FREE): "free",
+    int(mujoco.mjtJoint.mjJNT_BALL): "ball",
+    int(mujoco.mjtJoint.mjJNT_SLIDE): "slide",
+    int(mujoco.mjtJoint.mjJNT_HINGE): "hinge",
+}
+_JOINT_UNITS = {"free": "m/rad", "ball": "quat", "slide": "m", "hinge": "rad"}
+
+
+def _actuator_mode(model: mujoco.MjModel, aid: int) -> str:
+    """按 MuJoCo 增益/偏置配置推断控制模式（torque/position/velocity）。"""
+    bias = int(model.actuator_biastype[aid])
+    if bias == int(mujoco.mjtBias.mjBIAS_NONE):
+        return "torque"
+    prm = model.actuator_biasprm[aid]
+    if abs(float(prm[1])) > 0.0:
+        return "position"
+    if abs(float(prm[2])) > 0.0:
+        return "velocity"
+    return "force"
+
+
+class Simulation:
+    """单实例一次仿真。__init__ 起进程，run 驱动，close 收尾。
+
+    autostart_controllers=False：不起控制器进程，只编译世界。遥操作由
+    会话层每 tick 直接写 data.ctrl（见 simovia/teleop.py），控制器进程
+    不参与；普通 run 仍走多进程栅栏。
+    """
+
+    def __init__(self, spec: WorldSpec, autostart_controllers: bool = True):
+        self.spec = spec
+        self.model, self.index = build_world(spec)
+        self.task = resolve_task(spec.task, self.index)
+        self.data = mujoco.MjData(self.model)
+        from simovia.world.initial import apply_initial_state
+        apply_initial_state(spec, self.model, self.data, self.index)
+
+        self._ctx = zmq.Context()
+        self._router = self._ctx.socket(zmq.ROUTER)
+        self._router.setsockopt(zmq.LINGER, 0)
+        port = self._router.bind_to_random_port("tcp://127.0.0.1")
+        self._addr = f"tcp://127.0.0.1:{port}"
+        self._poller = zmq.Poller()
+        self._poller.register(self._router, zmq.POLLIN)
+
+        self.controller_frames = {}
+        self.controller_results = {}
+        # 平台级雷达建图：声明过 lidar 的机器人各一张融合图，推进时喂帧；
+        # controller_overlays: {robot: {label: {"segments": [[x1,y1,x2,y2]...],
+        #                                        "points": [[x,y]...]}}}
+        # 控制器经 publish_overlay 发布的矢量叠加层（路径/roadmap/目标点），
+        # GUI"雷达建图"面板随地图一起拉取渲染
+        self.lidar_mappers: dict[str, object] = {}
+        for rd in spec.robots:
+            if not any(s.type == "lidar" for s in rd.sensors):
+                continue
+            if any(s.type == "lidar" and s.channels > 1 for s in rd.sensors):
+                # 3D 多线雷达：点云建图（体素 + 俯视投影栅格 + 槽位镜像）
+                m = PointCloudMapper(spec.scene.floor.size)
+                if self.index.pointcloud:
+                    m.bind_slots(self.model, self.index.pointcloud["geoms"])
+                self.lidar_mappers[rd.name] = m
+            else:
+                self.lidar_mappers[rd.name] = LidarMapper(spec.scene.floor.size)
+        self.controller_overlays: dict[str, dict[str, dict]] = {}
+        self._vision_renderers = {}
+        self.tick = 0
+        self._ran = False               # 是否已跑过一轮 run（暂停续跑判断用）
+        # robot name -> 运行时状态
+        self._st: dict[str, dict] = {}
+        self._procs: dict[str, subprocess.Popen] = {}
+        self._pumps: dict[str, threading.Thread] = {}   # stdout 转投线程
+        self._ident: dict[bytes, str] = {}      # zmq identity -> robot name
+        # Supervisor 快照（__init__ 在 reset 用）
+        self._snaps: dict[str, tuple] = {}
+        self._coordinator = None
+        self._coordinator_factory = None
+        if autostart_controllers and any(r.args.get('shared_world_controller') is True for r in spec.robots):
+            import runpy
+            paths = {(spec.base_dir / r.controller).resolve() for r in spec.robots if r.controller}
+            if len(paths) != 1 or not all(r.controller and r.args.get('shared_world_controller') is True for r in spec.robots):
+                self.close()
+                raise WorldError('共享控制器必须由所有机器人绑定同一个脚本')
+            try:
+                self._coordinator_factory = runpy.run_path(str(paths.pop()))['create_controller']
+                self._coordinator = self._coordinator_factory(self)
+            except Exception:
+                self.close()
+                raise
+        supervisor.save_state(self.model, self.data, self._snaps,
+                              supervisor.INIT_TAG, tick=0, internal=True)
+        if autostart_controllers and self._coordinator is None:
+            self._spawn_controllers()
+
+    # ---------------------------------------------------------------- 子进程
+
+    def _spawn_controllers(self):
+        env = dict(os.environ)
+        # 控制器子进程要能 import simovia
+        pkg_root = str(pathlib.Path(__file__).resolve().parents[2])
+        env["PYTHONPATH"] = pkg_root + os.pathsep + env.get("PYTHONPATH", "")
+        for rd in self.spec.robots:
+            nu = len(self.index.robots[rd.name].actuators)
+            self._st[rd.name] = {
+                "active": False,       # 已完成 hello 握手
+                "done": False,         # 正常退出
+                "crashed": False,      # 进程异常退出
+                "ctrl": [0.0] * nu,    # 最近一次真实控制量
+                "pending": 0,          # 已收到的待执行 step 步数
+                "reply_sock": None,    # 等待回复的 zmq identity
+                "lag": 0,              # 超时补位次数
+            }
+            if not rd.controller:
+                continue
+            path = pathlib.Path(rd.controller)
+            if not path.is_absolute():
+                path = self.spec.base_dir / path
+            if not path.exists():
+                raise WorldError(f"机器人 '{rd.name}' 的控制器不存在: {path}")
+            # stdout 不能直通：内核若在 MCP 后端里跑，stdout 是 JSON-RPC
+            # 协议通道，控制器 print 会污染协议流。stdin 也显式给 DEVNULL：
+            # 控制器只与内核走 ZMQ，读 stdin 只会把协议流吃掉（或在不同
+            # 平台的继承语义下卡住）。stdout/stderr 合并进同一条管道再
+            # 转投 stderr（带 "[机器人名] " 前缀）——既不污染协议，新手
+            # 又能用 print 调试控制律，且控制器起不来（import 报错等）的
+            # 真相一定可见：输出不依赖继承来的句柄，由内核主动排空。
+            cmd = [sys.executable, str(path),
+                   "--sock", self._addr, "--robot", rd.name]
+            popen_kwargs = dict(env=env, stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT)
+            if sys.platform == "win32":
+                # pythonw（桌面快捷方式）下 spawn 控制台子进程会闪黑窗；
+                # stdout/stderr 已是管道，CREATE_NO_WINDOW 只影响控制台宿主
+                popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+            proc = subprocess.Popen(cmd, **popen_kwargs)
+            if os.environ.get("SIMOVIA_CTRL_TRACE"):
+                sys.stderr.write(
+                    f"[spawn] {rd.name} pid={proc.pid} addr={self._addr} "
+                    f"cmd={proc.args}\n")
+                sys.stderr.flush()
+            self._procs[rd.name] = proc
+            self._pumps[rd.name] = self._pump_stdout(rd.name, proc)
+
+    @staticmethod
+    def _pump_stdout(name: str, proc: subprocess.Popen) -> threading.Thread:
+        """把控制器 stdout+stderr（合并管道）逐行转投到内核 stderr。
+
+        前缀标注机器人名，便于区分多机器人世界的输出。管道读端由这个
+        线程独占关闭：close() 若从主线程关，会撞上读线程持有的缓冲区
+        锁而阻塞（控制器留下继承 stdout 的子进程时永远等不到 EOF，整个
+        close 卡死）。
+        """
+        def pump():
+            try:
+                for raw in iter(proc.stdout.readline, b""):
+                    if sys.stderr is None:        # pythonw 无控制台
+                        continue
+                    sys.stderr.write(
+                        f"[{name}] {raw.decode('utf-8', 'replace')}")
+                    sys.stderr.flush()
+            except (ValueError, OSError):
+                pass          # 解释器收尾/文件被关，忽略
+            finally:
+                try:
+                    proc.stdout.close()
+                except (ValueError, OSError):
+                    pass
+        thread = threading.Thread(target=pump, name=f"ctrl-out-{name}",
+                                  daemon=True)
+        thread.start()
+        return thread
+
+    # ---------------------------------------------------------------- 收发
+
+    def _send(self, ident: bytes, msg: dict):
+        # REQ/ROUTER 协议：[identity, 空分隔帧, payload]
+        self._router.send_multipart([ident, b"", json.dumps(msg).encode()])
+
+    def _handle(self, ident: bytes, msg: dict) -> None:
+        op = msg.get("op")
+        if op == "hello":
+            self._hello(ident, msg)
+        elif op == "step":
+            self._step_request(ident, msg)
+        elif op == "bye":
+            rname = self._ident.get(ident, msg.get("robot"))
+            if rname in self._st:
+                self._st[rname]["done"] = True
+                self._st[rname]["active"] = False
+            # REQ/REP 必须回复，否则控制器 close() 里的 recv 会挂死
+            self._send(ident, {"op": "bye_ack"})
+        elif op in ("observe", "camera", "contacts", "camera_overlay",
+                    "map_overlay", "result", "reset_objects"):
+            self._device_request(ident, msg)
+        elif op == "supervise":
+            self._supervise(ident, msg)
+        else:
+            self._send(ident, {"op": "error", "msg": f"未知 op: {op!r}"})
+
+    def _device_request(self, ident, msg):
+        """On-demand devices run on the same thread as physics, never on stale copies."""
+        import base64
+        import zlib
+        from simovia.render import render_offscreen, encode_png
+        name=self._ident.get(ident)
+        try:
+            if name is None:raise WorldError("设备读取需要先握手")
+            op=msg["op"]
+            if op=="result":
+                if not isinstance(msg.get("success"),bool):raise WorldError("success 必须是 bool")
+                self.controller_results[name]={"success":msg["success"],"detail":str(msg.get("detail",""))[:1000]}
+                self._send(ident,{"op":"ok"});return
+            if op=="observe":
+                self._send(ident,self._obs_msg(name));return
+            if op=="map_overlay":
+                # 控制器向"雷达建图"面板发布矢量叠加层（同名整体替换）。
+                # 必须在相机查找之前处理——overlay 的 name 是图层名不是相机名
+                label=str(msg.get("name","overlay"))[:40] or "overlay"
+                segs_in=msg.get("segments") or []
+                pts_in=msg.get("points") or []
+                if len(segs_in)>1500 or len(pts_in)>500:
+                    raise WorldError("叠加层超限：最多 1500 线段 / 500 点")
+                def _flat(v,w):
+                    out=[]
+                    for item in v:
+                        item=[float(x) for x in item]
+                        if len(item)!=w or not all(math.isfinite(x) for x in item):
+                            raise WorldError(f"叠加层数值必须是 {w} 个有限数")
+                        out.append(item)
+                    return out
+                self.controller_overlays.setdefault(name,{})[label]={
+                    "segments":_flat(segs_in,4),"points":_flat(pts_in,2)}
+                self._send(ident,{"op":"ok"});return
+            if op=="reset_objects":
+                self._reset_objects()
+                self._send(ident,{"op":"ok"});return
+            if op=="contacts":
+                own=set(self.index.robots[name].bodies.values());values={}
+                for i,c in enumerate(self.data.contact):
+                    b1=int(self.model.geom_bodyid[c.geom1]);b2=int(self.model.geom_bodyid[c.geom2])
+                    for body,other in ((b1,b2),(b2,b1)):
+                        if body in own and other not in own:
+                            f=np.zeros(6);mujoco.mj_contactForce(self.model,self.data,i,f)
+                            key=self.model.body(body).name[len(name)+1:]
+                            values[key]=values.get(key,0.)+float(abs(f[0]))
+                self._send(ident,{"op":"contacts","forces_N":values});return
+            sensor=msg.get("name")
+            cid=self.index.robots[name].cameras.get(sensor)
+            camera=name+"/"+sensor
+            if cid is None:
+                # 场景固定机位（scene.cameras）不属于任何机器人，按原名直接查
+                cid=self.index.cameras.get(sensor)
+                if cid is None:raise WorldError(f"相机不存在: {sensor}")
+                camera=sensor
+            width,height=int(msg.get("width",640)),int(msg.get("height",480))
+            if not (64<=width<=1280 and 48<=height<=960):raise WorldError("相机分辨率超出范围")
+            if op=="camera_overlay":
+                raw=base64.b64decode(msg['rgb'],validate=True)
+                if len(raw)!=width*height*3:raise WorldError("RGB 长度与分辨率不一致")
+                rgb=np.frombuffer(raw,dtype=np.uint8).reshape(height,width,3)
+                self.controller_frames[camera]=(self.tick,encode_png(rgb))
+                self._send(ident,{"op":"ok"});return
+            key=(width,height)
+            if key not in self._vision_renderers:self._vision_renderers[key]=mujoco.Renderer(self.model,height,width)
+            rgb=render_offscreen(self.model,self.data,width,height,camera,renderer=self._vision_renderers[key])
+            self._send(ident,{"op":"camera","width":width,"height":height,"tick":self.tick,
+                              "rgb_zlib":base64.b64encode(zlib.compress(rgb.tobytes(),1)).decode('ascii')})
+        except Exception as error:
+            self._send(ident,{"op":"error","msg":str(error)})
+
+    def _reset_objects(self):
+        """把场景动态物体（YAML scene.objects 的自由体）搬回初始位姿并清零速度。
+
+        只动物体、不动关节机器人：机械臂由控制器自己 ramp 回预备姿态，否则
+        控制器每 tick 下发的位置目标会和内核直接写 qpos 打架。
+        """
+        for bid in self.index.objects.values():
+            if int(self.model.body_jntnum[bid]) == 0:
+                continue
+            jid = int(self.model.body_jntadr[bid])
+            if int(self.model.jnt_type[jid]) != int(mujoco.mjtJoint.mjJNT_FREE):
+                continue
+            qadr = int(self.model.jnt_qposadr[jid])
+            vadr = int(self.model.jnt_dofadr[jid])
+            self.data.qpos[qadr:qadr + 7] = self.model.qpos0[qadr:qadr + 7]
+            self.data.qvel[vadr:vadr + 6] = 0.0
+        mujoco.mj_forward(self.model, self.data)
+
+    def close_device_renderers(self):
+        for renderer in self._vision_renderers.values():renderer.close()
+        self._vision_renderers.clear()
+
+    # ---------------------------------------------------------------- supervisor
+
+    def save_state(self, tag: str) -> None:
+        supervisor.save_state(self.model, self.data, self._snaps, tag, self.tick)
+
+    def load_state(self, tag: str) -> None:
+        self.tick = supervisor.load_state(self.model, self.data,
+                                          self._snaps, tag)
+
+    def get_state(self, tag: str) -> tuple:
+        snap = self._snaps.get(tag)
+        if snap is None:
+            raise WorldError(
+                f"快照 '{tag}' 不存在；可用: {supervisor.list_tags(self._snaps)}")
+        return snap
+
+    def teleport(self, name: str, pos) -> None:
+        supervisor.teleport(self.model, self.data, self.index, name, pos)
+
+    def reset(self) -> None:
+        """回到编译完成、还没跑过任何 tick 的初始状态。"""
+        if self._coordinator is not None:
+            self._coordinator.close()
+        self.load_state(supervisor.INIT_TAG)
+        if self._coordinator_factory is not None:
+            from simovia.world.initial import apply_initial_state
+            mujoco.mj_resetData(self.model, self.data)
+            apply_initial_state(self.spec, self.model, self.data, self.index)
+            self._coordinator = self._coordinator_factory(self)
+            self.controller_results.clear()
+
+    def ensure_controllers(self) -> bool:
+        """确保控制器进程在跑（继续推进用）。返回是否重新拉起。
+
+        run 收尾现在保留控制器进程（暂停语义），暂停后继续推进时一般直接
+        命中 alive 分支、返回 False——控制器上下文原样续用。只有当控制器
+        自行跑完 episode 退出（进程已不在）时才重新 spawn；此时新进程从
+        初始相位开始，与当前物理状态继续配合（旧行为，便于多段验证跑完
+        一个 episode 后再来一轮）。
+        """
+        if not self._ran or not self._procs:
+            return False                 # 没跑过 / 无控制器世界（或没起过进程）
+        # 上一轮收尾后控制器可能还没退干净（已回 bye、正在退出）：它们
+        # 已标 done，不算"在跑"。真正在跑的（活着且未 done/crashed）才
+        # 说明有 run 在进行，不能重复 spawn。
+        alive = [p for n, p in self._procs.items()
+                 if p.poll() is None
+                 and not self._st.get(n, {}).get("done")
+                 and not self._st.get(n, {}).get("crashed")]
+        if alive:
+            return False
+        deadline = time.perf_counter() + 2.0   # 等退出中的进程收尾，避免泄漏
+        for proc in self._procs.values():
+            remain = deadline - time.perf_counter()
+            if remain <= 0 or proc.poll() is not None:
+                continue
+            try:
+                proc.wait(timeout=remain)
+            except subprocess.TimeoutExpired:
+                proc.terminate()
+        self._procs.clear()
+        self._pumps.clear()
+        self._ident.clear()
+        self._st.clear()
+        self._spawn_controllers()
+        return True
+
+    def _supervise(self, ident: bytes, msg: dict) -> None:
+        action = msg.get("action")
+        try:
+            if action == "save":
+                self.save_state(msg.get("tag"))
+            elif action == "load":
+                self.load_state(msg.get("tag"))
+            elif action == "teleport":
+                self.teleport(msg.get("body"), msg.get("pos"))
+            elif action == "reset":
+                self.reset()
+            else:
+                raise WorldError(
+                    f"未知 supervise action: {action!r}，"
+                    f"支持: save/load/teleport/reset")
+        except WorldError as e:
+            self._send(ident, {"op": "error", "msg": str(e)})
+            return
+        self._send(ident, {"op": "ok", "tick": self.tick,
+                           "time": float(self.data.time)})
+
+    def _hello(self, ident: bytes, msg: dict):
+        rname = msg.get("robot", "")
+        if rname not in self._st:
+            self._send(ident, {"op": "error", "msg": f"世界里没有机器人 '{rname}'"})
+            return
+        rd = next(r for r in self.spec.robots if r.name == rname)
+        ridx = self.index.robots[rname]
+        ranges = [list(map(float, self.model.actuator_ctrlrange[ridx.actuators[a]]))
+                  for a in ridx.actuators]
+        sensors_manifest = [{"name": six.name, "type": six.kind, "dim": six.dim}
+                            for six in ridx.sensors.values()]
+        # 关节在 qpos 观测里的宽度：free=7、ball=4、其余=1。控制器按名字
+        # 切分 qpos 时必须用这张表，否则浮动机器人的 qpos 会整体错位。
+        layout = obs_layout(self.model, ridx)
+        self._ident[ident] = rname
+        self._send(ident, {
+            "op": "init", "robot": rname,
+            "actuators": list(ridx.actuators), "ranges": ranges,
+            "args": rd.args, "ctrl_period": self.spec.ctrl_period,
+            "timestep": self.spec.timestep,
+            "sensors": sensors_manifest,
+            "world_spec": world_to_dict(self.spec),
+            "joint_widths": {n: w for n, (_, _, w) in layout.items()},
+        })
+        self._st[rname]["active"] = True
+
+    def _step_request(self, ident: bytes, msg: dict):
+        rname = self._ident.get(ident)
+        if rname is None:
+            self._send(ident, {"op": "error", "msg": "未握手就发 step"})
+            return
+        st = self._st[rname]
+        ctrl = msg.get("ctrl", st["ctrl"])
+        ridx = self.index.robots[rname]
+        if len(ctrl) != len(ridx.actuators):
+            self._send(ident, {"op": "error",
+                               "msg": f"控制量长度 {len(ctrl)} != 执行器数 "
+                                      f"{len(ridx.actuators)}"})
+            st["crashed"] = True
+            st["active"] = False
+            return
+        st["ctrl"] = [float(c) for c in ctrl]
+        st["pending"] = int(msg.get("n", 1))
+        st["reply_sock"] = ident
+
+    # ---------------------------------------------------------------- 推进
+
+    def _barrier_participants(self) -> list[str]:
+        """栅栏参与者 = 进程还在运行且没退出（不管握没握手）的控制器。
+
+        关键点：握手没完成也占栅栏位，内核绝不提前推进——
+        否则后连上的控制器相位会错位（M0.3 实测踩过）。
+        """
+        return [n for n, p in self._procs.items()
+                if p.poll() is None
+                and not self._st[n]["done"] and not self._st[n]["crashed"]]
+
+    def _barrier_ready(self) -> bool:
+        parts = self._barrier_participants()
+        if not parts:
+            return False
+        return all(self._st[n]["pending"] > 0 for n in parts)
+
+    def _feed_lidar_mappers(self) -> None:
+        """平台级雷达建图：每个 lidar 机器人喂一帧（所有雷达融合进同一张图）。
+
+        读数现算（_obs_msg 里那份是控制器的），纯 mj_ray 只读、轨迹零影响；
+        只在推进线程写栅格，MCP 协议线程只读 grid()——无锁安全。
+        控制器栅栏与无控制器空跑两条推进路径都调它，保证任何世界每 tick 一帧。
+        3D 多线雷达（480 束/帧）降频到每 2 控制tick 一帧（~15.6Hz 建图输入
+        足够），喂完同步槽位镜像（写 geom_pos/rgba + geom_xpos，静态 body
+        恒等关系不碰 warmstart）。
+        """
+        for rname, ridx in self.index.robots.items():
+            mapper = self.lidar_mappers.get(rname)
+            if mapper is None:
+                continue
+            for six in ridx.sensors.values():
+                if six.lidar is None:
+                    continue
+                if isinstance(mapper, PointCloudMapper):
+                    if self.tick % 2:
+                        continue              # 3D 降频：每 2 控制tick 一帧
+                    origin, rot = lidar_frame(self.data, six)
+                    mapper.update(origin, rot, six.lidar["dirs"],
+                                  lidar_scan(self.model, self.data, six),
+                                  float(six.lidar["range"]))
+                    # 槽位镜像更降频（每 8 tick）：纯 python 循环，槽位数大
+                    # （4000）时每帧全量重写会拖慢推进；GUI 点云走 MCP pc 段
+                    # （拉取时列表化），内核镜像只是位姿直读路径，低频足够
+                    if self.tick % 8 == 0:
+                        mapper.sync_slots(self.data)
+                else:
+                    px, py, yaw = lidar_pose(self.data, six)
+                    mapper.update(px, py, yaw, six.lidar["angles"],
+                                  lidar_scan(self.model, self.data, six),
+                                  float(six.lidar["range"]))
+
+    def _advance(self, budget: int | None = None,
+                 on_sample: "callable | None" = None,
+                 sample_stride: int | None = None,
+                 pace: "callable | None" = None) -> None:
+        parts = self._barrier_participants()
+        n = min(self._st[n]["pending"] for n in parts)
+        if budget is not None:
+            n = min(n, budget)   # 不越过 max_ticks
+        if n <= 0:
+            return
+        # 写控制量（名字索引 -> 裸 id，内核唯一裸 id 出现的地方）
+        for name in parts:
+            st = self._st[name]
+            ids = list(self.index.robots[name].actuators.values())
+            self.data.ctrl[ids] = st["ctrl"]
+            st["pending"] -= n
+        # 物理步按 sample_stride 切片：每片先对齐墙钟再出观测，这样实时
+        # 播放中间态是"随时间铺开"的，而不是 tick 开头瞬间刷 32 步再卡住
+        # 64ms。切片不改变 mj_step 的调用次数与顺序，轨迹仍逐位一致。
+        steps = n * self.spec.ctrl_period
+        stride = sample_stride if sample_stride and sample_stride > 0 else steps
+        callback = on_sample is not None
+        for i in range(1, steps + 1):
+            mujoco.mj_step(self.model, self.data)
+            if callback and (i % stride == 0 or i == steps):
+                if pace is not None:
+                    pace()
+                on_sample()
+        self.tick += n
+        self._feed_lidar_mappers()
+        # 回观测（REQ/REP：每个已归零 pending 的请求恰好一个回复）
+        for name in parts:
+            st = self._st[name]
+            if st["pending"] == 0 and st["reply_sock"] is not None:
+                self._send(st["reply_sock"], self._obs_msg(name))
+                st["reply_sock"] = None
+
+    def _obs_msg(self, robot_name: str) -> dict:
+        ridx = self.index.robots[robot_name]
+        qpos, qvel = robot_obs(ridx, self.model, self.data)
+        bodies = {name: [float(x) for x in self.data.xpos[bid]]
+                  for name, bid in ridx.bodies.items()}
+        # 场景物体全局可见（控制闭环需要：抓取要看着 cube 的位置）
+        objects = {name: [float(x) for x in self.data.xpos[bid]]
+                   for name, bid in self.index.objects.items()}
+        msg = {
+            "op": "obs", "tick": self.tick, "time": float(self.data.time),
+            "ctrl": list(map(float, self.data.ctrl[
+                list(ridx.actuators.values())])),
+            "joint_names": list(ridx.joints), "qpos": qpos, "qvel": qvel,
+            "bodies": bodies, "objects": objects,
+        }
+        # 名字驱动的关节/执行器视图：qpos/ctrl 按下标一一对应只在"一关节
+        # 一执行器、顺序相同"时成立；球关节（qpos 4 维）、被动关节、耦合
+        # 夹爪都会打破它。GUI 观测面板据此按名字配对并标注类型/单位/模式。
+        lay = obs_layout(self.model, ridx)
+        jmap = {}
+        for jname, jid in ridx.joints.items():
+            off, _voff, width = lay[jname]
+            jtype = int(self.model.jnt_type[jid])
+            tname = _JOINT_TYPE_NAMES.get(jtype, "other")
+            jmap[jname] = {"q": qpos[off:off + width], "type": tname,
+                           "unit": _JOINT_UNITS.get(tname, "")}
+        joint_by_id = {jid: jname for jname, jid in ridx.joints.items()}
+        amap = {}
+        for aname, aid in ridx.actuators.items():
+            target = int(self.model.actuator_trnid[aid][0])
+            limited = bool(self.model.actuator_ctrllimited[aid])
+            lo, hi = self.model.actuator_ctrlrange[aid]
+            amap[aname] = {
+                "u": float(self.data.ctrl[aid]),
+                "joint": joint_by_id.get(target),
+                "mode": _actuator_mode(self.model, aid),
+                "ctrlrange": ([float(lo), float(hi)] if limited else None),
+            }
+        msg["actuator_forces"] = {n:float(self.data.actuator_force[a]) for n,a in ridx.actuators.items()}
+        msg["joints"] = jmap
+        msg["actuators"] = amap
+        # 浮动基座躯干位姿（四足/人形）。匿名 free joint 不在 joints/qpos 里，
+        # 单独下发 [x,y,z,qw,qx,qy,qz]，GUI 渲染端据此写回 free joint；
+        # 固定基座机械臂无此键
+        qadr = root_freejoint_qadr(self.model, ridx)
+        if qadr is not None:
+            msg["root"] = [float(v) for v in self.data.qpos[qadr:qadr + 7]]
+        # 传感器读数（声明过的机器人才有这个键；sensordata 在 mj_step 末尾已就绪；
+        # 拼接语义见 kernel/task.py，与 RL env 共用）
+        if ridx.sensors:
+            msg["sensors"] = sensors_obs(ridx, self.model, self.data)
+        return msg
+
+    def _check_crashes(self) -> None:
+        for name, proc in self._procs.items():
+            if proc.poll() is not None and not self._st[name]["done"]:
+                # 进程退出且不是 bye 正常退出：看退出码。
+                # stop 通知后控制器正常收尾（exit 0、可能没发 bye——用户
+                # 脚本未必调 robot.close()）不算崩溃；非零退出码才是。
+                if proc.returncode != 0:
+                    self._st[name]["crashed"] = True
+                self._st[name]["active"] = False
+
+    def _notify_stop(self) -> None:
+        for st in self._st.values():
+            if st["reply_sock"] is not None:
+                self._send(st["reply_sock"], {"op": "stop"})
+                st["reply_sock"] = None
+                st["pending"] = 0
+
+    # ---------------------------------------------------------------- 主循环
+
+    def run(self, max_ticks: int | None = None,
+            on_tick: "callable | None" = None,
+            realtime: bool | None = None,
+            stop_check: "callable | None" = None,
+            on_sample: "callable | None" = None,
+            ctrl_fn: "callable | None" = None) -> dict:
+        """推进仿真，返回统计。max_ticks 缺省用世界 task.max_ticks（再缺省 10000）。
+
+        on_tick(tick)：每个控制 tick 推进后的回调（GUI/MCP 用来抽观测快照）。
+        回调在同一线程内同步调用，此时 data 处于一致状态，可安全读取。
+
+        realtime：True/False 覆盖世界 runtime.realtime；None 用世界设置。
+        开启后按墙钟对齐仿真时间（GUI 看动画用；机器跑批应关闭以全速推进）。
+
+        stop_check()：每个控制 tick 检查一次，返回 True 时提前收尾
+        （GUI"停止"按钮 / MCP stop 工具）。收尾后控制器进程保留为暂停态：
+        下一段 run 从同一控制器上下文（局部变量/相位机进度）继续，分段
+        运行与连续运行的物理轨迹一致；reset/load_world/close 才终止控制器。
+
+        on_sample()：实时模式下按约 _SAMPLE_HZ 把控制 tick 内的物理步切片，
+        每片对齐墙钟后回调一次（给 GUI 出中间帧）。非实时模式不切片。
+        不传时行为与旧版一致（只在 on_tick 出帧）。
+
+        ctrl_fn(model, data)：仅无控制器进程（autostart_controllers=False 的
+        遥操作 / 无 controller 世界）时使用——每个控制 tick 推进前调用一次，
+        由它写 data.ctrl。有控制器进程时忽略（控制权在控制器脚本）。
+        """
+        if max_ticks is None:
+            max_ticks = self.spec.task.max_ticks
+        if max_ticks is None:
+            max_ticks = 10_000
+        timeout_ms = int(self.spec.runtime.controller_timeout)   # schema 单位就是 ms
+        policy = self.spec.runtime.timeout_policy
+        if realtime is None:
+            realtime = self.spec.runtime.realtime
+        self._ran = True
+        t_start, sim_start = time.perf_counter(), self.data.time
+
+        def _pace():
+            """实时节流：把墙钟对齐到已推进的仿真时间。"""
+            if not realtime:
+                return
+            behind = ((self.data.time - sim_start)
+                      - (time.perf_counter() - t_start))
+            if behind > 0:
+                time.sleep(behind)
+
+        # 实时播放的子步采样：约 1/60 s 仿真时间一片（不足 1 步按 1 步）
+        sample_stride = None
+        if realtime and on_sample is not None:
+            sample_stride = max(
+                1, int(round((1.0 / _SAMPLE_HZ) / self.spec.timestep)))
+
+        if self._coordinator is not None:
+            controller = self._coordinator
+            while self.tick < max_ticks and not controller.done:
+                if stop_check is not None and stop_check():
+                    break
+                if not controller.advance():
+                    break
+                self.tick += 1
+                if on_tick is not None:
+                    on_tick()
+                if on_sample is not None:
+                    on_sample()
+                _pace()
+            if controller.done:
+                self.controller_results = {r.name: {'success': controller.success,
+                    'detail': controller.detail} for r in self.spec.robots}
+            stats = self._stats(t_start, sim_start)
+            stats['done'] = [r.name for r in self.spec.robots] if controller.done else []
+            return stats
+
+        # 无控制器的世界：直接空跑（scene_gen 冒烟等用途）。
+        # max_ticks 是"目标总 tick"（与控制器分支的 budget=max_ticks-tick
+        # 语义一致）：暂停后继续 run 不会把 N 步进重复累加。
+        if not self._procs:
+            while self.tick < max_ticks:
+                if stop_check is not None and stop_check():
+                    break
+                if ctrl_fn is not None:
+                    ctrl_fn(self.model, self.data)
+                for i in range(1, self.spec.ctrl_period + 1):
+                    mujoco.mj_step(self.model, self.data)
+                    if on_sample is not None and sample_stride is not None \
+                            and (i % sample_stride == 0
+                                 or i == self.spec.ctrl_period):
+                        _pace()
+                        on_sample()
+                self.tick += 1
+                self._feed_lidar_mappers()
+                if on_tick is not None:
+                    on_tick()
+                _pace()
+            self.close_device_renderers()
+            return self._stats(t_start, sim_start)
+
+        # 等所有控制器完成握手（进程死光则放弃等待）。
+        # 必须有 stop 出口和超时：进程活着但握手不完成时（Windows 上
+        # 控制器 import/加载卡死的典型症状），原先这里会永久转圈——
+        # run() 不返回、stop_check 无人查，GUI 就是"卡住且无法停止"。
+        self._check_crashes()   # 先扫一遍：spawn 后即死的控制器要在 stats 里可见
+        hs_deadline = time.perf_counter() + _HANDSHAKE_TIMEOUT
+        while True:
+            parts = self._barrier_participants()
+            if not parts or all(self._st[n]["active"] for n in parts):
+                break
+            if stop_check is not None and stop_check():
+                # 停止请求落在握手等待期：此时控制器还没进 step 循环，
+                # 无法用 stop 消息优雅收尾，直接终止进程（标记 done，
+                # 不计 crashed——这是用户主动停止，不是故障）
+                self._abort_controllers()
+                self.close_device_renderers()
+                return self._stats(t_start, sim_start)
+            if time.perf_counter() > hs_deadline:
+                diag = "、".join(
+                    f"{n}(pid={self._procs[n].pid}, rc={self._procs[n].poll()})"
+                    for n in parts if not self._st[n]["active"])
+                tail = ""
+                tf = os.environ.get("SIMOVIA_CTRL_TRACE_FILE")
+                if tf and os.path.exists(tf):
+                    try:
+                        with open(tf, encoding="utf-8", errors="replace") as f:
+                            tail = "".join(f.readlines()[-6:])
+                    except OSError:
+                        pass
+                self._abort_controllers()
+                raise WorldError(
+                    f"控制器握手超时（{_HANDSHAKE_TIMEOUT:.0f}s）: {diag}。"
+                    "控制器进程还活着但没发 hello，常见原因：脚本 import 或"
+                    "模型加载卡死/极慢（Windows 冷启动尤甚）。控制器 "
+                    "stdout/stderr 已并入内核输出（带 [机器人名] 前缀），"
+                    "真实报错请到 GUI 控制台/后端日志查看；设 "
+                    "SIMOVIA_CTRL_TRACE=1 可打印握手阶段。"
+                    + (f" 追踪尾：{tail.strip()}" if tail else ""))
+            self._poll_once(timeout_ms)
+            self._check_crashes()
+
+        while self.tick < max_ticks and self._barrier_participants():
+            if stop_check is not None and stop_check():
+                break
+            got_msg = self._poll_once(timeout_ms)
+            self._check_crashes()
+            parts = self._barrier_participants()
+            if not parts:
+                break
+            # 还有控制器没握手：不推进（防相位错位），继续等
+            if not all(self._st[n]["active"] for n in parts):
+                continue
+            if self._barrier_ready():
+                self._advance(budget=max_ticks - self.tick,
+                              on_sample=on_sample if sample_stride else None,
+                              sample_stride=sample_stride,
+                              pace=_pace if sample_stride else None)
+                if on_tick is not None:
+                    on_tick()
+            elif policy == "last_ctrl" and not got_msg:
+                # 只在真超时（队列空）时补位，队列里还有消息就继续收
+                for name in parts:
+                    if self._st[name]["pending"] == 0:
+                        self._st[name]["pending"] = 1
+                        self._st[name]["lag"] += 1
+            # pause: 什么都不做，下一轮继续等
+            _pace()
+
+        # 分段/暂停语义（报告 F1）：本段 run 收尾不通知控制器退出——进程和
+        # 局部变量（控制器 phase_i 等）保留，下一段 run 从同一上下文继续，
+        # 多段累计轨迹与一次连续运行一致。控制器自行跑完 episode 时进程已
+        # 退出，无需处理；只有 close()（load_world/reset/后端退出）才终止。
+        self.close_device_renderers()
+        return self._stats(t_start, sim_start)
+
+    def _drain_controllers(self, grace_ms: int = 500) -> None:
+        """run 收尾的残余消息排空：stop 只能回复"正在等回复"的控制器，
+        若控制器恰好在两次 step 之间（obs 刚到手、下一 step 未发出），
+        那个 step 会落在 run 返回之后——不排空它就永久阻塞（压测实测
+        泄漏）。这里再 poll 一小段，把残余 step 逐个用 stop 回掉。
+        """
+        deadline = time.perf_counter() + grace_ms / 1000
+        while time.perf_counter() < deadline:
+            if not self._barrier_participants():
+                return
+            self._poll_once(50)
+            self._check_crashes()
+            self._notify_stop()
+
+    def _abort_controllers(self, grace_ms: int = 500) -> None:
+        """异常中止（握手超时/握手期停止）时的兜底收尾。
+
+        正常收尾靠 stop 消息，但握手等待期的控制器要么还在 Python
+        启动中、要么阻塞在等 hello 回复，没有"正在等 step 回复"的
+        机会，stop 消息对它们无效——不终止就永久泄漏（进程活着但
+        无人应答）。先 drain 一小段给已进 step 循环的控制器一个
+        优雅退出的机会，剩下的直接 terminate。
+        """
+        self._notify_stop()
+        self._drain_controllers(grace_ms)
+        for name, proc in self._procs.items():
+            if proc.poll() is None:
+                # 标 done 防 _check_crashes 误报 crashed（用户主动
+                # 停止/超时中止不属于进程故障）
+                self._st[name]["done"] = True
+                self._st[name]["active"] = False
+                proc.terminate()
+
+    def _poll_once(self, timeout_ms: int) -> bool:
+        """收一条消息。返回 False 表示 poll 超时（队列空）。
+
+        只有真超时才允许 last_ctrl 补位——否则队列里还有消息没读，
+        会把准时的控制器误判成迟到（M0.3 实测踩过：lag=每 tick 一次）。
+        """
+        events = dict(self._poller.poll(timeout_ms))
+        if self._router not in events:
+            return False
+        parts = self._router.recv_multipart()
+        if len(parts) != 3:
+            return True
+        ident, _, payload = parts
+        try:
+            msg = json.loads(payload)
+        except json.JSONDecodeError:
+            self._send(ident, {"op": "error", "msg": "消息不是合法 JSON"})
+            return True
+        self._handle(ident, msg)
+        return True
+
+    def _task_success(self) -> bool | None:
+        """Scene task takes precedence; optional explicit controller reports otherwise."""
+        if self._coordinator is not None:
+            return self._coordinator.success if self._coordinator.done else None
+        result=task_success(self.task,self.data)
+        if result is not None:return result
+        names=[r.name for r in self.spec.robots if r.controller]
+        if names and any(n in self.controller_results for n in names):
+            return all(self.controller_results.get(n,{}).get('success',False) and not self._st[n]['crashed'] for n in names)
+        return None
+
+    def _task_reward(self) -> float:
+        """终态奖励值（语义实现见 kernel/task.py，与 RL env 共用）。"""
+        return task_reward(self.task, self.model, self.data)
+
+    def _stats(self, t_start: float, sim_start: float) -> dict:
+        return {
+            "ticks": self.tick,
+            "wall_time": round(time.perf_counter() - t_start, 3),
+            "sim_time": round(float(self.data.time - sim_start), 3),
+            "lag": sum(st["lag"] for st in self._st.values()),
+            "done": [n for n, st in self._st.items() if st["done"]],
+            "crashed": [n for n, st in self._st.items() if st["crashed"]],
+            "nan": bool(not np.all(np.isfinite(self.data.qpos))),
+            "success": self._task_success(),
+            "controller_results": dict(self.controller_results),
+            "reward": round(self._task_reward(), 4),
+        }
+
+    # ---------------------------------------------------------------- 收尾
+
+    def close(self):
+        if self._coordinator is not None:
+            self._coordinator.close()
+        self.close_device_renderers()
+        for proc in self._procs.values():
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+        # stdout 读端由 _pump_stdout 线程自己关（主线程关会撞锁卡死）；
+        # 控制器留下继承 stdout 的子进程时该线程会一直挂着，daemon 无妨
+        self._router.close(0)
+        self._ctx.term()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()

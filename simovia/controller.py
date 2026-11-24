@@ -1,0 +1,325 @@
+"""控制器侧客户端：用户在控制器脚本里唯一要 import 的东西。
+
+用法（Webots 风格）：
+
+    from simovia.controller import Robot
+
+    robot = Robot()                 # 自动从 --sock/--robot 命令行参数连接内核
+    while robot.step():             # 推进一 tick，返回观测 dict；内核叫停时返回 False
+        for name in robot.actuators:
+            lo, hi = robot.range(name)
+            robot.set(name, 目标值)  # 写控制量，下个 tick 生效
+        obs = robot.obs             # {"tick","time","qpos","qvel","bodies",...}
+
+约定：
+- 控制器是被内核 spawn 的独立进程，通过 ZMQ REQ 与内核栅栏同步
+- 一个 Robot 实例对应世界里一个机器人；step() 之外内核不会推消息
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+
+# 启动阶段追踪：设 SIMOVIA_CTRL_TRACE=1 时把握手各阶段打到 stderr
+# （Windows 上"进程活着但内核收不到 hello"只能靠这里定位卡点）。
+# SIMOVIA_CTRL_TRACE_FILE 再落一份到文件——子进程 stderr 可能拿不到时用。
+_TRACE = bool(os.environ.get("SIMOVIA_CTRL_TRACE"))
+_TRACE_FILE = os.environ.get("SIMOVIA_CTRL_TRACE_FILE")
+
+
+def _trace(msg: str) -> None:
+    line = f"[ctrl {os.getpid()}] {msg}\n"
+    if _TRACE:
+        try:
+            sys.stderr.write(line)
+            sys.stderr.flush()
+        except (OSError, ValueError, AttributeError):
+            pass          # stderr 不可用（pythonw / 句柄失效）不能拖垮握手
+    if _TRACE_FILE:
+        try:
+            with open(_TRACE_FILE, "a", encoding="utf-8") as f:
+                f.write(line)
+        except OSError:
+            pass
+
+
+_trace("controller module loaded (before import zmq)")
+
+import zmq  # noqa: E402
+
+_trace("zmq imported")
+
+
+class Robot:
+    """控制器脚本里的机器人句柄。"""
+
+    def __init__(self):
+        ns = self._parse_args()
+        _trace(f"args sock={ns.sock} robot={ns.robot}")
+        self.name = ns.robot
+        # 心跳：记录父进程（内核）pid。内核是控制器的直接父进程
+        # （Simulation spawn），内核一死即被感知——检测方式见
+        # _parent_dead()（POSIX 与 Windows 机制不同）
+        self._parent_pid = os.getppid()
+        _trace(f"parent pid={self._parent_pid}")
+        self._ctx = zmq.Context()
+        _trace("ctx created")
+        self._sock = self._ctx.socket(zmq.REQ)
+        self._sock.setsockopt(zmq.LINGER, 0)
+        # 不设 RCVTIMEO：等待无限。真实 Agent 在 load_world 与 run 之间有
+        # 长"思考时间"，控制器必须活着等内核开跑（Webots 语义：等世界）。
+        # 内核 close() 会 terminate 控制器进程；内核崩溃导致控制器孤儿挂死
+        # 属 M0 已知取舍（TODO: M1 心跳）。
+        self._sock.connect(ns.sock)
+        _trace("connected (async)")
+
+        init = self._rpc({"op": "hello", "robot": self.name})
+        _trace(f"hello reply op={init.get('op')}")
+        if init.get("op") == "error":
+            raise RuntimeError(f"内核拒绝连接: {init['msg']}")
+        self.actuators: list[str] = init["actuators"]
+        self.ranges: list[list[float]] = init["ranges"]
+        self.args: dict = init["args"]
+        self.world_spec: dict | None = init.get("world_spec")
+        self.ctrl_period: int = init["ctrl_period"]
+        self.timestep: float = init["timestep"]
+        # 传感器设备清单 [{name,type,dim}]（hello 握手下发；无传感器为 []）
+        self.sensors: list[dict] = init.get("sensors", [])
+        # 关节在 qpos 里的宽度（free=7 / ball=4 / 其余=1），joint_state 切分用
+        self.joint_widths: dict[str, int] = init.get("joint_widths", {})
+        self._ctrl = [0.0] * len(self.actuators)
+
+        self.obs: dict = {}
+        self.tick = -1
+        self.time = 0.0
+
+    # -------------------------------------------------- 用户 API
+
+    def set(self, name: str, value: float) -> None:
+        """写单个执行器目标值（名字引用，不碰裸 id）"""
+        if name not in self.actuators:
+            raise KeyError(f"机器人 '{self.name}' 没有执行器 '{name}'，"
+                           f"可用: {self.actuators}")
+        self._ctrl[self.actuators.index(name)] = float(value)
+
+    def set_all(self, values: list[float]) -> None:
+        """按 actuators 顺序一次写全部执行器"""
+        if len(values) != len(self.actuators):
+            raise ValueError(f"需要 {len(self.actuators)} 个值，实际 {len(values)}")
+        self._ctrl = [float(v) for v in values]
+
+    def range(self, name: str) -> tuple[float, float]:
+        """执行器控制量范围 (lo, hi)"""
+        return tuple(self.ranges[self.actuators.index(name)])
+
+    def step(self, n: int = 1) -> dict | False:
+        """提交当前控制量，推进 n 个控制 tick。
+
+        返回观测 dict；内核到达 max_ticks 或关闭时返回 False（调用方应退出循环）。
+        """
+        reply = self._rpc({"op": "step", "ctrl": self._ctrl, "n": int(n)})
+        if reply.get("op") == "stop":
+            return False
+        if reply.get("op") == "error":
+            raise RuntimeError(f"内核报错: {reply['msg']}")
+        self.obs = reply
+        self.tick = reply["tick"]
+        self.time = reply["time"]
+        self._ctrl = [float(c) for c in reply["ctrl"]]
+        return reply
+
+    def report_result(self,success,detail=""):
+        """Report a controller's own task check (separate from a YAML task predicate)."""
+        reply=self._rpc({"op":"result","success":bool(success),"detail":str(detail)})
+        if reply.get("op")=="error":raise RuntimeError(reply["msg"])
+
+    def observe(self):
+        """Read encoders without advancing simulation."""
+        reply=self._rpc({"op":"observe"})
+        if reply.get("op")=="error":raise RuntimeError(reply["msg"])
+        self.obs=reply;self.tick=reply["tick"];self.time=reply["time"]
+        self._ctrl=list(reply["ctrl"])
+        return reply
+
+    def reset_objects(self):
+        """把场景动态物体搬回初始位姿（机械臂不动，由控制器自己回位）。"""
+        reply=self._rpc({"op":"reset_objects"})
+        if reply.get("op")=="error":raise RuntimeError(reply["msg"])
+
+    def camera(self,name,width=640,height=480):
+        """Current RGB uint8 image from this robot's declared camera."""
+        import base64,zlib,numpy as np
+        reply=self._rpc({"op":"camera","name":name,"width":width,"height":height})
+        if reply.get("op")=="error":raise RuntimeError(reply["msg"])
+        return np.frombuffer(zlib.decompress(base64.b64decode(reply["rgb_zlib"])),dtype=np.uint8).reshape(reply["height"],reply["width"],3).copy()
+
+    def contact_forces(self):
+        """Normal contact force per robot body, excluding robot self-contact (N)."""
+        reply=self._rpc({"op":"contacts"})
+        if reply.get("op")=="error":raise RuntimeError(reply["msg"])
+        return reply["forces_N"]
+
+    def publish_camera(self,name,rgb):
+        """Publish an annotated RGB frame to the software's camera preview."""
+        import base64,numpy as np
+        rgb=np.ascontiguousarray(rgb,dtype=np.uint8)
+        if rgb.ndim!=3 or rgb.shape[2]!=3:raise ValueError("Expected HxWx3 RGB")
+        reply=self._rpc({"op":"camera_overlay","name":name,"width":rgb.shape[1],"height":rgb.shape[0],"rgb":base64.b64encode(rgb.tobytes()).decode('ascii')})
+        if reply.get("op")=="error":raise RuntimeError(reply["msg"])
+
+    def publish_overlay(self,name,segments=None,points=None):
+        """发布矢量叠加层（世界系坐标）到平台的"雷达建图"面板。
+
+        name 是图层名（同名整体替换，如 "path"/"prm"/"goal"）；segments 是
+        [[x1,y1,x2,y2],...] 折线段集合，points 是 [[x,y],...] 点集合。控制
+        器把规划结果（路径、roadmap、目标点）发上来，GUI 在雷达地图上
+        叠加渲染——建图本身由内核自动累积，控制器无需自己画图发布。
+        """
+        # 只做数值化透传，不做长度过滤——坏数据交服务端校验拒绝，
+        # 控制器拿到 error 回复抛 RuntimeError，而不是被静默吞掉。
+        def _flat(v):
+            return [[float(x) for x in item] for item in (v or [])]
+        reply=self._rpc({"op":"map_overlay","name":str(name),
+                         "segments":_flat(segments),"points":_flat(points)})
+        if reply.get("op")=="error":raise RuntimeError(reply["msg"])
+
+    def joint_state(self) -> dict:
+        """便捷读取：{关节名: 位置}。
+
+        浮动机器人的命名 free 关节在 qpos 里占 7 个数（xyz+四元数），ball
+        占 4 个，取出来是定长列表；其余关节返回标量。以前直接 zip
+        joint_names/qpos，浮动机器人从 free 关节之后全部错位。
+        """
+        qpos = self.obs.get("qpos", [])
+        out: dict = {}
+        i = 0
+        for name in self.joint_names:
+            w = int(self.joint_widths.get(name, 1))
+            out[name] = qpos[i] if w == 1 else qpos[i:i + w]
+            i += w
+        return out
+
+    def sensor(self, name: str) -> float | list[float]:
+        """读传感器最近读数（dim=1 标量；imu 等多维返回列表），从最近一次观测取。
+
+        相机 RGB 图像使用 camera(name)，数值传感器使用本方法。
+        """
+        vals = (self.obs.get("sensors") or {}).get(name)
+        if vals is None:
+            declared = [s["name"] for s in self.sensors]
+            if name in declared:
+                raise RuntimeError(f"传感器 '{name}' 的读数还没到——先 step() 一次")
+            raise KeyError(f"机器人 '{self.name}' 没有传感器 '{name}'，"
+                           f"可用: {declared}")
+        return vals
+
+    def supervise(self, action: str, **params) -> dict:
+        """Supervisor 操作：save/load/teleport/reset。
+
+        例: robot.supervise("save", tag="snap")
+            robot.supervise("load", tag="snap")
+            robot.supervise("teleport", body="cube", pos=[1.0, 1.0, 0.2])
+            robot.supervise("reset")
+        回包带内核 tick（load/reset 会改变 tick，这里自动同步）。
+        """
+        reply = self._rpc({"op": "supervise", "action": action, **params})
+        if reply.get("op") == "error":
+            raise RuntimeError(f"supervisor 错误: {reply['msg']}")
+        if "tick" in reply:
+            self.tick = reply["tick"]
+            self.time = reply.get("time", self.time)
+        return reply
+
+    # -------------------------------------------------- 内部
+
+    @property
+    def joint_names(self) -> list[str]:
+        return self.obs.get("joint_names", [])
+
+    @staticmethod
+    def _parse_args():
+        # 内核 spawn 时传 --sock/--robot；用户脚本自己的参数用 parse_known 跳过
+        ap = argparse.ArgumentParser(add_help=False)
+        ap.add_argument("--sock", required=True)
+        ap.add_argument("--robot", required=True)
+        return ap.parse_known_args()[0]
+
+    def _rpc(self, msg: dict) -> dict:
+        self._sock.send(json.dumps(msg).encode())
+        return self._recv()
+
+    def _parent_dead(self) -> bool:
+        """内核（父进程）是否已死亡。
+
+        POSIX：父死后子进程被 init/subreaper 收养，getppid 必变。
+        Windows：没有收养机制，父死后 getppid 仍返回原 pid（C 运行时
+        缓存），只能用 Win32 API 探测：OpenProcess 打不开（进程已
+        消失/句柄无效）或 GetExitCodeProcess != STILL_ACTIVE 即死亡。
+        """
+        if sys.platform == "win32":
+            import ctypes
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            STILL_ACTIVE = 259
+            kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+            # Win64 下句柄是指针宽度，ctypes 默认 restype=c_int 会把句柄
+            # 截断成 32 位（高位非零时误判"进程不存在"），必须显式声明
+            kernel32.OpenProcess.restype = ctypes.c_void_p
+            kernel32.OpenProcess.argtypes = (ctypes.c_uint32, ctypes.c_int,
+                                             ctypes.c_uint32)
+            kernel32.GetExitCodeProcess.restype = ctypes.c_int
+            kernel32.GetExitCodeProcess.argtypes = (ctypes.c_void_p,
+                                                    ctypes.c_void_p)
+            kernel32.CloseHandle.restype = ctypes.c_int
+            kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+            handle = kernel32.OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION, False, self._parent_pid)
+            if not handle:
+                return True                   # 进程不存在（或已无权查询）
+            try:
+                code = ctypes.c_ulong()
+                kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
+                return code.value != STILL_ACTIVE
+            finally:
+                kernel32.CloseHandle(handle)
+        return os.getppid() != self._parent_pid
+
+    def _recv(self) -> dict:
+        """等回复：100ms poller 轮询 + 父进程孤儿检测（心跳）。
+
+        等待在语义上仍然无限（Webots：等世界，Agent 思考多久都行）——
+        唯一的退出条件是内核进程死亡（_parent_dead，跨平台），
+        此时 RuntimeError 提示用户脚本结束（不捕获则进程非零退出）。
+        内核正常收尾走 stop/bye_ack 回复路径，不经孤儿检测。
+        """
+        poller = zmq.Poller()
+        poller.register(self._sock, zmq.POLLIN)
+        waits = 0
+        try:
+            while True:
+                if poller.poll(100):          # 有消息立即返回（微秒级）
+                    return json.loads(self._sock.recv())
+                waits += 1
+                if _TRACE and waits <= 5:
+                    _trace(f"waiting reply #{waits} parent_dead="
+                           f"{self._parent_dead()}")
+                if self._parent_dead():
+                    raise RuntimeError(
+                        "内核已退出（心跳检测到父进程变化）——请结束控制器脚本")
+        finally:
+            poller.unregister(self._sock)
+
+    def close(self) -> None:
+        try:
+            self._sock.send(json.dumps({"op": "bye"}).encode())
+            try:
+                # 告别收尾：内核会回 bye_ack；短超时兜底（内核可能已停止 poll）
+                self._sock.setsockopt(zmq.RCVTIMEO, 200)
+                self._sock.recv()
+            except zmq.error.Again:
+                pass
+        except Exception:
+            pass
+        self._sock.close()
+        self._ctx.term()

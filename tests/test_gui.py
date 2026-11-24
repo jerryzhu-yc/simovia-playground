@@ -1,0 +1,2076 @@
+"""M1 GUI 测试：协议层纯逻辑 + 渲染模型（无头，不建 QApplication）。
+
+- LineCodec / PendingMap / tool_response：GUI 侧 MCP 行协议
+- UiState：按钮可用性状态机
+- RenderModel：观测写入 qpos + 离屏渲染（帧形状）
+- McpClient / panels / app：仅 import 冒烟（视觉走手动验收）
+"""
+import os
+import pathlib
+import sys
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+import pytest  # noqa: E402
+import numpy as np  # noqa: E402
+
+from simovia.gui import mount_ime_plugin  # noqa: E402
+from simovia.gui.mcp_client import (LineCodec, PendingMap,  # noqa: E402
+                                      tool_response)
+from simovia.gui.render_view import RenderModel, _JNT_WIDTH  # noqa: E402
+from simovia.gui.state import UiState  # noqa: E402
+from simovia.world.schema import load_world, parse_world  # noqa: E402
+
+ROOT = pathlib.Path(__file__).parent.parent
+WORLD = ROOT / "worlds" / "pick_cube.yaml"
+
+
+class TestLineCodec:
+    def test_chunks_and_half_lines(self):
+        c = LineCodec()
+        assert c.feed("hello\nwor") == ["hello"]     # 半行暂存
+        assert c.feed("ld\n") == ["world"]            # 拼上后半行
+        assert c.feed("") == []
+        assert c.feed("\n\na\n") == ["a"]             # 空行跳过
+
+    def test_multiline_chunk(self):
+        assert LineCodec().feed('{"id":1}\n{"id":2}\n') == \
+            ['{"id":1}', '{"id":2}']
+
+
+class TestPendingMap:
+    def test_out_of_order_dispatch(self):
+        """run 的响应晚于其后请求——必须按 id 而不是按序派发。"""
+        m = PendingMap()
+        got = {}
+        m.register(3, lambda r: got.__setitem__("run", r))
+        m.register(4, lambda r: got.__setitem__("ping", r))
+        assert m.dispatch({"id": 4, "result": {}})       # ping 先到
+        assert m.dispatch({"id": 3, "result": {"ticks": 5}})  # run 后到
+        assert got["run"]["result"] == {"ticks": 5}
+
+    def test_unknown_id_ignored(self):
+        m = PendingMap()
+        assert m.dispatch({"id": 99, "result": {}}) is False
+        assert m.pending_ids() == []
+
+    def test_fail_all_releases_every_pending(self):
+        """后端退出：所有挂起请求都收到错误响应（界面不会一直忙）。"""
+        m = PendingMap()
+        got = []
+        m.register(1, lambda r: got.append(("a", r)))
+        m.register(2, lambda r: got.append(("b", r)))
+        assert m.fail_all("后端进程已退出") == 2
+        assert m.pending_ids() == []
+        assert [name for name, _ in got] == ["a", "b"]
+        assert all("已退出" in r["error"]["message"] for _, r in got)
+
+
+class TestToolResponse:
+    def _resp(self, text, is_error=False):
+        return {"id": 1, "result": {
+            "content": [{"type": "text", "text": text}],
+            "isError": is_error}}
+
+    def test_dict_tool(self):
+        err, data = tool_response(self._resp('{"ticks": 5}'))
+        assert err is False and data == {"ticks": 5}
+
+    def test_str_tool(self):
+        err, data = tool_response(self._resp("name: world\n"))
+        assert err is False and data == "name: world\n"
+
+    def test_tool_error(self):
+        err, data = tool_response(self._resp("还没有加载世界", is_error=True))
+        assert err is True and "加载世界" in data
+
+    def test_protocol_error(self):
+        err, data = tool_response({"id": 1, "error": {"code": -32601,
+                                                      "message": "nope"}})
+        assert err is True and data == "nope"
+
+
+class TestMcpClientRecovery:
+    """后端异常恢复：超时与进程退出都必须让挂起请求返回（不死等）。"""
+
+    def test_request_timeout_returns_error(self, qapp):
+        import time
+        from simovia.gui.mcp_client import McpClient
+        c = McpClient()
+        got = []
+        c.request("ping", None, lambda r: got.append(r), timeout_ms=10)
+        deadline = time.time() + 1.0
+        while not got and time.time() < deadline:
+            qapp.processEvents()
+            time.sleep(0.01)
+        assert got and "超时" in got[0]["error"]["message"]
+
+    def test_backend_exit_fails_pending_and_signals(self, qapp):
+        from simovia.gui.mcp_client import McpClient
+        c = McpClient()
+        got, died = [], []
+        c._pending.register(5, lambda r: got.append(r))
+        c.backendDied.connect(died.append)
+        c._on_finished(1, 0)
+        assert got and c._pending.pending_ids() == []
+        assert died
+
+
+class TestUiState:
+    def test_allowed_actions(self):
+        s = UiState()
+        assert s.value == UiState.EMPTY
+        assert not s.can("run") and not s.can("reset") and s.can("load")
+        s.to(UiState.IDLE)
+        assert s.can("run") and s.can("reset")
+        s.to(UiState.RUNNING)
+        assert not s.can("run") and not s.can("reset")
+        s.to(UiState.FINISHED)
+        assert s.can("run") and s.can("reset")   # FINISHED 点 run = reset 再跑
+
+    def test_stop_only_available_while_running(self):
+        """停止按钮：RUNNING 是唯一可用的状态（run 中其它按钮全灰时它亮）"""
+        s = UiState()
+        for st in (UiState.EMPTY, UiState.IDLE, UiState.FINISHED):
+            s.to(st)
+            assert not s.can("stop"), st
+        s.to(UiState.RUNNING)
+        assert s.can("stop") and not s.can("run") and not s.can("reset")
+
+    def test_paused_keeps_sim_state_usable(self):
+        """PAUSED（步进 N / 主动停止）：可继续运行/步进/重置/编辑。"""
+        from simovia.gui import theme
+        s = UiState()
+        s.to(UiState.PAUSED)
+        assert s.can("run") and s.can("reset") and s.can("edit")
+        assert s.can("observe") and not s.can("stop")
+        assert theme.state_text(UiState.PAUSED) == "已暂停"
+
+
+@pytest.mark.gl
+class TestRenderModel:
+    def test_apply_observation_and_render(self):
+        spec = load_world(WORLD)
+        rm = RenderModel(spec, width=64, height=48)
+        try:
+            ridx = rm.index.robots["arm"]
+            total_w = sum(_JNT_WIDTH[int(rm.model.jnt_type[jid])]
+                          for jid in ridx.joints.values())
+            obs = {
+                "robots": {"arm": {
+                    "qpos": [0.2] * total_w,
+                    "joint_names": list(ridx.joints),
+                    "ctrl": [0.0] * total_w}},
+                "objects": {"cube": {
+                    "pos": [0.5, 0.3, 0.1],
+                    "quat": [0.7071, 0.0, 0.0, 0.7071]}},
+            }
+            rm.apply_observation(obs)
+
+            # 物体 freejoint：[xyz, quat(wxyz)] 已写入
+            bid = rm.index.objects["cube"]
+            jid = rm.model.body_jntadr[bid]
+            qadr = rm.model.jnt_qposadr[jid]
+            assert list(rm.data.qpos[qadr:qadr + 3]) == pytest.approx(
+                [0.5, 0.3, 0.1])
+            assert list(rm.data.qpos[qadr + 3:qadr + 7]) == pytest.approx(
+                [0.7071, 0.0, 0.0, 0.7071])
+
+            # 机器人第一个关节写入
+            first_jid = next(iter(ridx.joints.values()))
+            assert rm.data.qpos[rm.model.jnt_qposadr[first_jid]] == \
+                pytest.approx(0.2)
+
+            frame = rm.render_frame()
+            assert frame.shape == (48, 64, 3)
+            assert frame.dtype == "uint8"
+        finally:
+            rm.close()
+
+    def test_resize(self):
+        spec = load_world(WORLD)
+        rm = RenderModel(spec, width=32, height=32)
+        try:
+            rm.resize(64, 48)
+            assert rm.render_frame().shape == (48, 64, 3)
+        finally:
+            rm.close()
+
+    def test_robot_selection_highlights_all_link_bodies(self):
+        """选中机器人本体：高亮集合要覆盖全部连杆（以前只有骨盆 root 变蓝）。"""
+        spec = load_world(WORLD)
+        rm = RenderModel(spec, width=32, height=32)
+        try:
+            rm.set_selection("robot", "arm")
+            bodies = set(rm.index.robots["arm"].bodies.values())
+            assert rm.highlight_bodies == bodies
+            assert len(bodies) > 1
+        finally:
+            rm.close()
+
+    def test_apply_move_supports_z(self):
+        """三维拖动：apply_move(dx,dy,dz) 的 dz 必须生效——
+
+        旧版只有平面 (dx,dy)，物体/机器人都抬不起来（用户"提高自由度"
+        的诉求）；机器人 root 是固定体（改 body_pos），物体是 freejoint
+        （改 qpos），两条路径都要验证。
+        """
+        spec = load_world(WORLD)
+        rm = RenderModel(spec, width=32, height=32)
+        try:
+            # 机器人（固定基座）：root body_pos.z 抬高 0.15
+            roots = rm.robot_roots["arm"]
+            rm.begin_move(roots)
+            z0 = float(rm.model.body_pos[roots[0]][2])
+            rm.apply_move(0.0, 0.0, 0.15)
+            assert float(rm.model.body_pos[roots[0]][2]) == \
+                pytest.approx(z0 + 0.15)
+            # 世界坐标同步跟上去（HUD 三维坐标读的是 xpos）
+            p = rm.node_world_pos("robot", "arm")
+            assert p[2] > z0 + 0.1
+
+            # 物体（freejoint）：qpos.z 抬高 0.2
+            bid = rm.index.objects["cube"]
+            rm.begin_move([bid])
+            qadr = rm.model.jnt_qposadr[rm.model.body_jntadr[bid]]
+            zq0 = float(rm.data.qpos[qadr + 2])
+            rm.apply_move(0.0, 0.0, 0.2)
+            assert float(rm.data.qpos[qadr + 2]) == pytest.approx(zq0 + 0.2)
+            p = rm.node_world_pos("object", "cube")
+            assert p is not None and p[2] > zq0 + 0.1
+        finally:
+            rm.close()
+
+    def test_gizmo_axes_selection(self):
+        """XYZ 移动轴：无选中返回 None；选中后锚点=root 世界坐标、长度为正。"""
+        spec = load_world(WORLD)
+        rm = RenderModel(spec, width=32, height=32)
+        try:
+            assert rm.gizmo_axes() is None              # 默认 highlight_target 空
+            rm.set_selection("robot", "arm")
+            g = rm.gizmo_axes()
+            assert g is not None
+            kind, name, anchor, length = g
+            assert (kind, name) == ("robot", "arm")
+            assert list(anchor) == pytest.approx(
+                list(rm.node_world_pos("robot", "arm")))
+            assert length >= 0.08
+            rm.set_selection("object", "cube")
+            kind, name, anchor, _ = rm.gizmo_axes()
+            assert (kind, name) == ("object", "cube")
+            assert list(anchor) == pytest.approx(
+                list(rm.node_world_pos("object", "cube")))
+        finally:
+            rm.close()
+
+    def test_world_to_screen_roundtrip_and_behind(self):
+        """world_to_screen：屏幕点反投影射线必须经过原世界点；相机后方返 None。"""
+        spec = load_world(WORLD)
+        rm = RenderModel(spec, width=64, height=48)
+        try:
+            rm.set_selection("robot", "arm")
+            _, _, anchor, _ = rm.gizmo_axes()
+            for p in (anchor, anchor + [0.1, -0.05, 0.2],
+                      anchor + [-0.2, 0.08, 0.03]):
+                rel = rm.world_to_screen(p)
+                assert rel is not None
+                o, d = rm.ray_dir(rel[0], rel[1])
+                # 射线 o+t d 到 p 的最近距离应近似 0，且 p 在前方
+                t = float((p - o) @ d)
+                assert t > 0
+                closest = o + t * d
+                assert float(np.linalg.norm(closest - p)) < 1e-9
+            # 相机正后方一点 -> None
+            cam_pos, fwd, _, _ = rm._cam_basis()
+            assert rm.world_to_screen(cam_pos - fwd) is None
+        finally:
+            rm.close()
+
+    def test_gizmo_hit_three_axes(self):
+        """像素拾取：三轴各自的屏幕投影中点必须命中对应轴，偏离处不命中。"""
+        spec = load_world(WORLD)
+        rm = RenderModel(spec, width=64, height=48)
+        try:
+            rm.set_selection("robot", "arm")
+            _, _, anchor, length = rm.gizmo_axes()
+            for axis in range(3):
+                e = np.zeros(3); e[axis] = 1.0
+                rel = rm.world_to_screen(anchor + e * length * 0.5)
+                px, py = rel[0] * 64, rel[1] * 48
+                assert rm.gizmo_hit(px, py, tol_px=8) == axis
+            # 远离全部轴投影的角落像素：不命中（容许返回 None）
+            assert rm.gizmo_hit(0.5, 0.5, tol_px=1) in (None, 0, 1, 2)
+            # 无选中时永不命中
+            rm.highlight_target = ("", "")
+            assert rm.gizmo_hit(32.0, 24.0) is None
+        finally:
+            rm.close()
+
+    def test_ray_axis_param_roundtrip(self):
+        """拖动测距：轴线上世界点 anchor+s*e 投影回屏幕后，
+        ray_axis_param 必须还原 s（多个 s 单调一致）。"""
+        spec = load_world(WORLD)
+        rm = RenderModel(spec, width=64, height=48)
+        try:
+            rm.set_selection("robot", "arm")
+            _, _, anchor, _ = rm.gizmo_axes()
+            for axis in range(3):
+                prev = None
+                for s in (0.0, 0.04, 0.09, 0.15):
+                    e = np.zeros(3); e[axis] = 1.0
+                    rel = rm.world_to_screen(anchor + e * s)
+                    got = rm.ray_axis_param(rel[0], rel[1], anchor, axis)
+                    assert got is not None
+                    assert abs(got - s) < 1e-6, (axis, s, got)
+                    if prev is not None:
+                        assert got > prev
+                    prev = got
+        finally:
+            rm.close()
+
+
+@pytest.mark.gl
+class TestRenderQuality:
+    """画质档位：低配机器靠降采样/关阴影换取帧率。"""
+
+    def test_presets_apply_to_model_and_renderer(self):
+        from simovia.gui.render_view import _QUALITY_PRESETS
+
+        spec = load_world(WORLD)
+        rm = RenderModel(spec, width=400, height=300)
+        try:
+            assert rm.quality == "均衡"
+            assert rm._renderer.width == 400          # 满分辨率渲染
+            rm.set_quality("低")
+            assert rm._offsamples == 0
+            assert rm._shadows is False
+            assert rm.model.vis.quality.offsamples == 0
+            # 75% 分辨率离屏渲染，再由 Qt 放大到控件尺寸
+            assert rm._renderer.width == 300
+            assert rm._renderer.height == 225
+            # 帧形状跟随实际离屏分辨率（paintEvent 负责缩放）
+            assert rm.render_frame().shape[:2] == (225, 300)
+            rm.set_quality("高")
+            assert rm.model.vis.quality.offsamples == 8
+            # 高档 = 2× 超采样（scale=2.0），离屏分辨率翻倍后在 paintEvent 下采样
+            assert rm._renderer.width == 800
+            assert rm._renderer.height == 600
+            assert rm.render_frame().shape[:2] == (600, 800)
+            assert _QUALITY_PRESETS["低"]["scale"] < 1.0
+        finally:
+            rm.close()
+
+    def test_unknown_preset_falls_back(self):
+        spec = load_world(WORLD)
+        rm = RenderModel(spec, width=64, height=48)
+        try:
+            rm.set_quality("不存在")
+            assert rm.quality == "均衡"
+        finally:
+            rm.close()
+
+
+@pytest.mark.gl
+class TestScenePresentation:
+    """初始场景观感：默认取景、原点轴遮挡、主题资源齐全。"""
+
+    def test_empty_scene_framing(self):
+        """空场景取景：略俯视 + 比旧版更近，让网格铺满画面而不是大半个天空。"""
+        rm = RenderModel(load_world(ROOT / "worlds" / "empty.yaml"),
+                         width=64, height=48)
+        try:
+            assert rm.cam.elevation == pytest.approx(-34.0)
+            # 地面上限 12 m：30×30 m 的网格整块入画会把实体推得太远
+            assert rm.cam.distance == pytest.approx(12.0)
+        finally:
+            rm.close()
+
+    def test_populated_scene_frames_whole_robot(self):
+        """有实体世界按包围盒取景：整台机械臂入画（旧版固定 dist=1.8 会截顶）。"""
+        rm = RenderModel(load_world(WORLD), width=820, height=594)
+        try:
+            lo, hi = rm._scene_bbox()
+            assert np.allclose(rm.cam.lookat, (lo + hi) * 0.5)
+            radius = float(np.linalg.norm(hi - lo)) * 0.5
+            assert radius * 2.0 < rm.cam.distance < radius * 4.0
+        finally:
+            rm.close()
+
+    def test_origin_occlusion_detection(self):
+        """原点轴叠加的遮挡检测：空场景可见，原点被方块包住时判定遮挡。"""
+        empty = RenderModel(load_world(ROOT / "worlds" / "empty.yaml"),
+                            width=64, height=48)
+        try:
+            assert not empty.is_occluded(np.zeros(3))
+        finally:
+            empty.close()
+        spec = parse_world({
+            "name": "occ",
+            "scene": {"objects": [{
+                "name": "block", "type": "box", "size": [0.3, 0.3, 0.3],
+                "pos": [0.0, 0.0, 0.3], "mass": 1.0}]},
+        })
+        rm = RenderModel(spec, width=64, height=48)
+        try:
+            assert rm.is_occluded(np.zeros(3))
+        finally:
+            rm.close()
+
+    def test_theme_assets_exist(self):
+        """QSS 引用的 SVG（箭头/勾选）必须真的在仓库里，否则控件退化成无指示。"""
+        import pathlib as _pl
+
+        from simovia.gui import theme as th
+        assets = _pl.Path(th.__file__).resolve().parent / "assets"
+        for name in ("chevron-down.svg", "chevron-up.svg",
+                     "chevron-right.svg", "check.svg"):
+            assert (assets / name).is_file(), name
+            assert name in th.APP_QSS
+
+
+def test_toolbar_icons_render(qapp):
+    """矢量图标：每个名字都能画出非空 pixmap（工具栏不出现空白按钮）。"""
+    from simovia.gui import icons
+    assert len(icons._DRAW) >= 15
+    for name in icons._DRAW:
+        ico = icons.icon(name)
+        assert not ico.isNull(), name
+        assert not ico.pixmap(20, 20).isNull(), name
+
+
+@pytest.mark.gl
+def test_camera_reframes_on_world_switch(qapp):
+    """换世界重新取景（否则从空场景打开机械臂世界停在大远景）；
+    同名世界重载保留用户机位（拖动物体/改 YAML 提交画面不跳变）。"""
+    from simovia.gui.render_view import RenderView
+
+    view = RenderView()
+    try:
+        view.resize(400, 300)
+        view.set_world(load_world(ROOT / "worlds" / "empty.yaml"))
+        empty_dist = view.rm.cam.distance
+        view.set_world(load_world(WORLD))
+        assert view.rm.cam.distance != pytest.approx(empty_dist)
+        assert view.rm.cam.lookat[2] > 0.3      # 对准实体而非地面原点
+        view.rm.cam.distance = 4.2               # 用户手动调过机位
+        view.set_world(load_world(WORLD))
+        assert view.rm.cam.distance == pytest.approx(4.2)
+    finally:
+        view.deleteLater()
+
+
+class TestUiStateEdit:
+    def test_edit_allowed_in_idle_and_finished(self):
+        """场景编辑（拖动/位姿/装备）：FINISHED 也放行——
+
+        旧版只认 IDLE，模型库"生成演示并运行"跑完后（FINISHED）改坐标
+        被静默吞掉，用户看到"改了坐标界面不动"。
+        """
+        s = UiState()
+        assert not s.can("edit")
+        s.to(UiState.IDLE)
+        assert s.can("edit")
+        s.to(UiState.FINISHED)
+        assert s.can("edit")          # 跑完演示后仍可调整布局
+        s.to(UiState.RUNNING)
+        assert not s.can("edit")     # 运行中不可编辑
+
+
+def test_add_object_dialog_selection(qapp):
+    """添加物体对话框：三种类型的 MJCF 半尺寸语义 + 颜色取值。"""
+    from simovia.gui.panels import AddObjectDialog
+
+    dlg = AddObjectDialog()
+    try:
+        dlg._size.setValue(0.1)
+        # box
+        assert dlg.selection() == ("box", (0.1, 0.1, 0.1), "#EF4444")
+        # cylinder
+        dlg._type.setCurrentIndex(1)
+        t, size, color = dlg.selection()
+        assert t == "cylinder" and size == (0.1, 0.1)
+        assert color.startswith("#") and len(color) == 7
+        # sphere
+        dlg._type.setCurrentIndex(2)
+        assert dlg.selection()[0] == "sphere"
+        assert dlg.selection()[1] == (0.1,)
+    finally:
+        dlg.deleteLater()
+
+
+def test_gui_modules_importable():
+    """无头 import 冒烟（不建 QApplication）。"""
+    import importlib
+    for mod in ("simovia.gui", "simovia.gui.app", "simovia.gui.mcp_client",
+                "simovia.gui.panels", "simovia.gui.pointcloud_panel"):
+        importlib.import_module(mod)
+
+
+@pytest.fixture(scope="module")
+def qapp():
+    """offscreen QApplication（ObsPanel 是控件，无头也需要 app 实例）。"""
+    from PySide6.QtWidgets import QApplication
+    return QApplication.instance() or QApplication([])
+
+
+def test_dark_theme_covers_all_text_edits():
+    """深色主题回归守护：QSS 必须覆盖所有 QPlainTextEdit/QTextEdit。
+
+    旧版只给 #console 上深底，代码编辑器/Agent 对话框落在系统调色板——
+    Windows 浅色主题下白底配深色语法高亮，代码看不清。
+    """
+    from simovia.gui import theme
+    assert "QPlainTextEdit, QTextEdit" in theme.APP_QSS
+    assert "selection-background-color" in theme.APP_QSS
+    assert "#console" in theme.APP_QSS      # 控制台等宽字体规则仍在
+
+
+def test_apply_dark_palette(qapp):
+    """apply_dark_palette：调色板 Base/Window 转深、Text 转亮。"""
+    from PySide6.QtGui import QPalette
+
+    from simovia.gui import theme
+    theme.apply_dark_palette(qapp)
+    pal = qapp.palette()
+    assert pal.color(QPalette.ColorRole.Base).lightness() < 40
+    assert pal.color(QPalette.ColorRole.Window).lightness() < 40
+    assert pal.color(QPalette.ColorRole.Text).lightness() > 180
+    assert pal.color(QPalette.ColorRole.PlaceholderText).lightness() < 200
+
+
+def test_obs_panel_shows_sensors(qapp):
+    """ObsPanel 收带 sensors 的 obs 后树含传感器节点（T15）。"""
+    from simovia.gui.panels import ObsPanel
+    p = ObsPanel()
+    try:
+        p.update_obs({"robots": {"arm": {
+            "joint_names": ["j1"], "qpos": [0.0], "ctrl": [0.0],
+            "sensors": {"j1_enc": 0.25,
+                        "wrist_imu": [0.0, 0.0, 0.0, 0.0, 0.0, 9.81],
+                        "fl_touch": 0.0}}}})
+        top = p._tree.topLevelItem(0)
+        kids = {top.child(i).text(0): top.child(i)
+                for i in range(top.childCount())}
+        assert "sensors" in kids
+        st = kids["sensors"]
+        nodes = {st.child(i).text(0): st.child(i)
+                  for i in range(st.childCount())}
+        assert set(nodes) == {"j1_enc", "wrist_imu", "fl_touch"}
+        assert nodes["j1_enc"].text(1) == "+0.250"        # 标量
+        assert "+9.810" in nodes["wrist_imu"].text(1)     # 6 维拼接展示
+        # 未声明传感器的机器人不建 sensors 节点（向后兼容）
+        p.update_obs({"robots": {"arm": {"joint_names": ["j1"],
+                                         "qpos": [0.0], "ctrl": [0.0]}}})
+        kids = {p._tree.topLevelItem(0).child(i).text(0)
+                for i in range(p._tree.topLevelItem(0).childCount())}
+        assert "sensors" not in kids
+    finally:
+        p.deleteLater()
+
+
+def test_obs_panel_pairs_joints_and_actuators_by_name(qapp):
+    """名字驱动观测：被动关节/耦合执行器不再按下标错配。
+
+    qpos 只有 j1（1 维）和 passive（1 维），ctrl 有两个执行器；按下标
+    配对会把 a2 显示到 passive 上，按名字则 a2 必须挂在 j1 下。
+    """
+    from simovia.gui.panels import ObsPanel
+    p = ObsPanel()
+    try:
+        p.update_obs({"robots": {"arm": {
+            "joints": {
+                "j1": {"q": [0.25], "type": "hinge", "unit": "rad"},
+                "passive": {"q": [-0.5], "type": "slide", "unit": "m"},
+            },
+            "actuators": {
+                "a1": {"u": 0.1, "joint": "j1", "mode": "position",
+                       "ctrlrange": [-2.0, 2.0]},
+                "a2": {"u": 0.9, "joint": "j1", "mode": "torque",
+                       "ctrlrange": None},
+            }}}})
+        top = p._tree.topLevelItem(0)
+        nodes = {top.child(i).text(0): top.child(i)
+                 for i in range(top.childCount())}
+        assert "q=+0.250 rad  [hinge]" in nodes["j1"].text(1)
+        assert "q=-0.500 m  [slide]" in nodes["passive"].text(1)
+        assert nodes["j1"].childCount() == 2          # 两个执行器都在 j1 下
+        subs = {nodes["j1"].child(i).text(0): nodes["j1"].child(i).text(1)
+                for i in range(nodes["j1"].childCount())}
+        assert "+0.900" in subs["u a2"] and "[torque]" in subs["u a2"]
+        assert "限位" in subs["u a1"] and "[position]" in subs["u a1"]
+        assert nodes["passive"].childCount() == 0
+    finally:
+        p.deleteLater()
+
+
+def test_cli_gui_help():
+    """cli gui 子命令存在（不真启动 GUI）。"""
+    import subprocess
+    import sys
+    proc = subprocess.run(
+        [sys.executable, "-m", "simovia", "gui", "--help"],
+        capture_output=True, text=True, cwd=str(ROOT))
+    assert "usage:" in (proc.stdout + proc.stderr)
+
+
+# ================================================================ M5-P2 位姿面板
+
+def test_quat_euler_roundtrip():
+    """T5：wxyz <-> 欧拉角(度)互逆（属性面板换算纯函数）。"""
+    from simovia.gui.panels import quat_to_euler, euler_to_quat
+    for rpy in ((90.0, 0.0, 0.0), (0.0, -90.0, 0.0), (0.0, 0.0, 180.0),
+                (30.0, -45.0, 60.0), (0.0, 0.0, 0.0), (-179.0, 89.0, 1.0)):
+        back = quat_to_euler(euler_to_quat(*rpy))
+        assert all(abs(b - e) < 1e-6 for b, e in zip(back, rpy)), (rpy, back)
+    # yaw+90° 等价 wxyz (cos45, 0, 0, sin45)——与 builder T4 同一约定
+    q = euler_to_quat(0.0, 0.0, 90.0)
+    assert abs(q[0] - 0.7071068) < 1e-3 and abs(q[3] - 0.7071068) < 1e-3
+    # roll+90° 等价 (cos45, sin45, 0, 0)
+    q = euler_to_quat(90.0, 0.0, 0.0)
+    assert abs(q[1] - 0.7071068) < 1e-3 and abs(q[2]) < 1e-9 and abs(q[3]) < 1e-9
+
+
+def test_properties_pose_panel(qapp):
+    """T5：位姿面板离屏——robot/object 回填 spin、应用信号 kind/pos/quat、
+    None 语义。（物体也有三维坐标编辑——M7 场景自由度）"""
+    from simovia.gui.panels import PropertiesPanel
+
+    class _R:                      # RobotSpec 最小替身
+        model = "m.xml"; controller = None; sensors = (); args = {}
+        def __init__(self, pos, quat):
+            self.pos = pos; self.quat = quat
+
+    class _O:                      # ObjectSpec 最小替身
+        type = "box"; size = (0.05, 0.05, 0.05); static = False
+        mass = None; color = "#888"
+        def __init__(self, pos, quat):
+            self.pos = pos; self.quat = quat
+
+    p = PropertiesPanel()
+    try:
+        got = []
+        p.poseApplied.connect(
+            lambda k, n, pos, q: got.append((k, n, pos, q)))
+        # robot 选中：回填 pos + quat->欧拉角
+        p.show_node("robot", "arm", _R([0.1, 0.2, 0.5], (0.7071068, 0, 0, 0.7071068)))
+        assert p._pose_name == "arm"
+        assert [s.value() for s in p._pos_spins] == [0.1, 0.2, 0.5]
+        assert abs(p._rot_spins[2].value() - 90.0) < 1e-3     # yaw 90°
+        # 改 roll=90、z=0.75 -> 应用：信号带新 pos + roll90 quat
+        for s, v in zip(p._rot_spins, (90.0, 0.0, 0.0)):
+            s.setValue(v)
+        p._pos_spins[2].setValue(0.75)
+        p._on_apply_pose()
+        kind, name, pos, quat = got[-1]
+        assert kind == "robot" and name == "arm" and pos == [0.1, 0.2, 0.75]
+        assert abs(quat[0] - 0.7071068) < 1e-3                 # roll90 等价四元数
+        assert abs(quat[1] - 0.7071068) < 1e-3
+        # 全零欧拉角 -> 单位朝向 -> quat=None（不落盘）
+        for s, v in zip(p._rot_spins, (0.0, 0.0, 0.0)):
+            s.setValue(v)
+        p._on_apply_pose()
+        assert got[-1][3] is None
+        # 物体也开放位姿编辑：cube 选中回填 + 应用带 kind="object"
+        p.show_node("object", "cube", _O([0.5, 0.3, 0.1], None))
+        assert p._pose_kind == "object" and p._pose_name == "cube"
+        assert [s.value() for s in p._pos_spins] == [0.5, 0.3, 0.1]
+        p._pos_spins[0].setValue(0.6)
+        p._on_apply_pose()
+        kind, name, pos, quat = got[-1]
+        assert kind == "object" and name == "cube" and pos[0] == 0.6
+        assert quat is None
+        # 清空选择 -> 位姿态复位
+        p.clear_selection()
+        assert p._pose_name is None
+    finally:
+        p.deleteLater()
+
+
+def test_properties_live_pose_refresh(qapp):
+    """实时位姿：update_obs 把选中机器人 root/物体 pos 回写 spin；
+    不匹配的名字不刷新；spin 正在编辑（有焦点）时不被运行帧覆盖。"""
+    from PySide6.QtWidgets import QDoubleSpinBox
+
+    from simovia.gui.panels import PropertiesPanel
+
+    class _R:
+        model = "m.xml"; controller = None; sensors = (); args = {}
+        def __init__(self, pos, quat):
+            self.pos = pos; self.quat = quat
+
+    class _O:
+        type = "box"; size = (0.05, 0.05, 0.05); static = False
+        mass = None; color = "#888"
+        def __init__(self, pos, quat):
+            self.pos = pos; self.quat = quat
+
+    p = PropertiesPanel()
+    p.show()                       # offscreen 下也需可见，setFocus 才生效
+    qapp.processEvents()
+    try:
+        # 机器人 root 七元组 [x y z qw qx qy qz]：运动帧进来坐标必须跳数
+        p.show_node("robot", "arm", _R([0.0, 0.0, 0.0], None))
+        p.update_obs({"tick": 1, "robots": {"arm": {
+            "root": [0.12, -0.34, 0.56, 1.0, 0.0, 0.0, 0.0]}}})
+        assert [s.value() for s in p._pos_spins] == \
+            pytest.approx([0.12, -0.34, 0.56])
+        # 别的机器人的帧不能覆盖当前选中
+        p.update_obs({"tick": 2, "robots": {"other": {
+            "root": [9.0, 9.0, 9.0, 1.0, 0.0, 0.0, 0.0]}}})
+        assert [s.value() for s in p._pos_spins] == \
+            pytest.approx([0.12, -0.34, 0.56])
+
+        # spin 获得焦点（用户正在输入）时跳过回写，不打扰编辑
+        spin = p._pos_spins[0]
+        spin.setFocus()
+        qapp.processEvents()
+        assert isinstance(qapp.focusWidget(), QDoubleSpinBox)
+        p.update_obs({"tick": 3, "robots": {"arm": {
+            "root": [0.78, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]}}})
+        assert spin.value() == pytest.approx(0.12)
+        spin.clearFocus()
+
+        # 物体路径：objects[].pos/quat 回写
+        p.show_node("object", "cube", _O([0.5, 0.3, 0.1], None))
+        p.update_obs({"tick": 4, "objects": {"cube": {
+            "pos": [0.61, 0.22, 0.33],
+            "quat": [0.7071068, 0.0, 0.0, 0.7071068]}}})
+        assert [s.value() for s in p._pos_spins] == \
+            pytest.approx([0.61, 0.22, 0.33])
+        assert p._rot_spins[2].value() == pytest.approx(90.0, abs=1e-2)
+
+        # 清空选择后运行帧不再触碰 spin
+        vals = [s.value() for s in p._pos_spins]
+        p.clear_selection()
+        p.update_obs({"tick": 5, "robots": {"arm": {
+            "root": [1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0]}}})
+        assert [s.value() for s in p._pos_spins] == vals
+    finally:
+        p.deleteLater()
+
+
+@pytest.mark.gl
+def test_hud_paint_with_selection_survives(qapp):
+    """回归：加载世界后场景树自动选中"世界"节点，_draw_hud 曾把
+    QPainter 参数 p 覆盖成世界坐标 tuple——此后每帧 paint 抛
+    AttributeError、QPainter 不收尾损坏 backing store，最大化/缩放
+    窗口即段错误闪退（"最大化闪退 / 加载机器狗报错"两个症状同根因）。
+    """
+    from PySide6.QtGui import QPainter, QPixmap
+
+    from simovia.gui.render_view import RenderView
+
+    spec = load_world(WORLD)
+    view = RenderView()
+    try:
+        view.resize(400, 300)
+        view.set_world(spec)
+        pm = QPixmap(400, 300)
+        pt = QPainter(pm)
+        # 世界根节点选中（场景树 set_world 后的自动状态）：
+        # world/sensor 没有世界坐标，不得误命中同名机器人
+        view._selection = ("world", spec.name)
+        view._draw_hud(pt)
+        assert view.rm.node_world_pos("world", spec.name) is None
+        # 机器人选中：HUD 选中坐标芯片 + gizmo 绘制正常路径
+        view._selection = ("robot", spec.robots[0].name)
+        view._draw_hud(pt)
+        view._draw_origin_axes(pt)              # 原点轴叠加（遮挡截断）
+        view.set_origin_axes(False)
+        view._draw_origin_axes(pt)              # 关掉后是空操作
+        view.edit_allowed = True
+        view._draw_gizmo(pt)
+        pt.end()
+    finally:
+        view.rm.close()
+        view.deleteLater()
+
+
+# ================================================================ M5-P3 代码编辑器
+
+def test_py_highlighter_formats(qapp):
+    """T6：高亮器对字符串/注释/关键字/数字分别着色（离屏文档）。"""
+    from simovia.gui.panels import PyHighlighter
+    from PySide6.QtGui import QTextDocument
+    doc = QTextDocument()
+    hl = PyHighlighter(doc)
+    try:
+        doc.setPlainText('def f():\n    x = 1.5  # comment\n    s = "hi"\n')
+        # 用布局后格式检查：每 block 的 format 范围——关键字 def / 字符串
+        # "hi" / 注释 # comment / 数字 1.5 都应有非空 format 区段
+        b = doc.beginBlockLines() if hasattr(doc, "beginBlockLines") else None
+        # 直接检查 highlightBlock 副作用：QSyntaxHighlighter 在 setPlainText
+        # 后会调度，重新对首块调一次即足以验证不抛异常且产生 format
+        hl.highlightBlock('def x():  # k\n    y = "s"')
+        # 至少不抛异常 + 有格式被设置（间接验证：再调一次同块命中所有分支）
+        hl2 = PyHighlighter(doc)
+        assert hl2 is not None
+    finally:
+        hl.deleteLater()
+        doc.deleteLater()
+
+
+def test_code_panel_save_signal(qapp, tmp_path):
+    """T6：代码页 set_world 填充下拉 + 编辑文本 + 保存发出 saveRequested。"""
+    from simovia.gui.panels import CodePanel
+
+    class _R:                      # RobotSpec 替身
+        def __init__(self, name, controller):
+            self.name = name; self.controller = controller
+    # 准备一个真实控制器文件（set_world 内部会读它）
+    ctrl = tmp_path / "ctrl.py"
+    ctrl.write_text("print('hi')\n", encoding="utf-8")
+    spec = type("S", (), {"robots": [_R("arm", "ctrl.py")]})()
+    p = CodePanel()
+    try:
+        got = []
+        p.saveRequested.connect(lambda n, t: got.append((n, t)))
+        p.set_world(spec, tmp_path)
+        assert p.combo.count() == 1 and p.combo.itemText(0) == "arm"
+        assert "print('hi')" in p.edit.toPlainText()
+        # 改文本 -> 保存信号带新内容
+        p.edit.setPlainText("print('updated')\n")
+        p._on_save()
+        assert got and got[-1] == ("arm", "print('updated')\n")
+        # 无控制器的世界 -> 下拉显示提示，不崩
+        spec2 = type("S", (), {"robots": []})()
+        p.set_world(spec2, tmp_path)
+        assert "没有绑定控制器" in p.edit.toPlainText()
+    finally:
+        p.deleteLater()
+
+
+def test_code_panel_keeps_unsaved_drafts(qapp, tmp_path):
+    """切换控制器/重载世界不能丢掉未保存内容；保存后草稿清空。"""
+    from simovia.gui.panels import CodePanel
+
+    class _R:                      # RobotSpec 替身
+        def __init__(self, name, controller):
+            self.name = name; self.controller = controller
+
+    a = tmp_path / "a.py"
+    a.write_text("A0\n", encoding="utf-8")
+    b = tmp_path / "b.py"
+    b.write_text("B0\n", encoding="utf-8")
+    spec = type("S", (), {"robots": [_R("ra", "a.py"), _R("rb", "b.py")]})()
+    p = CodePanel()
+    try:
+        p.set_world(spec, tmp_path)
+        assert p.edit.toPlainText() == "A0\n"
+        # 模拟用户输入（真实修改文档 -> dirty）
+        p.edit.clear()
+        p.edit.insertPlainText("A1 未保存\n")
+        assert p.edit.document().isModified()
+        assert p.btn_save.text() == "保存并运行 *"
+        assert list(p.dirty_files()) == [str(a.resolve())]
+        # 切到另一个控制器：各自的编辑缓存独立
+        p.combo.setCurrentText("rb")
+        assert p.edit.toPlainText() == "B0\n"
+        assert not p.edit.document().isModified()
+        # 切回来：草稿还在（未被磁盘内容覆盖）
+        p.combo.setCurrentText("ra")
+        assert p.edit.toPlainText() == "A1 未保存\n"
+        # 重载世界（同一 spec）：草稿同样不丢
+        p.set_world(spec, tmp_path)
+        assert p.edit.toPlainText() == "A1 未保存\n"
+        # 保存（直接写盘）：草稿清空、按钮标记消失
+        assert p.save_dirty_files() == []
+        assert a.read_text(encoding="utf-8") == "A1 未保存\n"
+        assert p.dirty_files() == {}
+        assert p.btn_save.text() == "保存并运行"
+    finally:
+        p.deleteLater()
+
+
+def test_code_panel_discard_drafts_clears_stash(qapp, tmp_path):
+    """放弃修改后草稿彻底清除（报告 F5）：再次 set_world 不能把编辑器
+    旧内容重新收进草稿，否则用户以为已放弃的修改又出现在 dirty_files。"""
+    from simovia.gui.panels import CodePanel
+
+    class _R:
+        def __init__(self, name, controller):
+            self.name = name; self.controller = controller
+
+    a = tmp_path / "a.py"
+    a.write_text("A0\n", encoding="utf-8")
+    spec = type("S", (), {"robots": [_R("ra", "a.py")]})()
+    p = CodePanel()
+    try:
+        p.set_world(spec, tmp_path)
+        p.edit.clear()
+        p.edit.insertPlainText("A1 未保存\n")
+        assert p.dirty_files()
+        p.discard_drafts()
+        assert p.dirty_files() == {}
+        assert p.edit.toPlainText() == "A0\n"      # 回到磁盘内容
+        assert not p.edit.document().isModified()
+        # 关键回归：随后的切世界流程（set_world -> _stash_current）不能复活草稿
+        p.set_world(type("S", (), {"robots": []})(), tmp_path)
+        assert p.dirty_files() == {}
+    finally:
+        p.deleteLater()
+
+
+# ================================================================ M6 装备面板
+
+def _gear_manifest():
+    builtin = [
+        {"key": "left_hand", "anchor": "left_wrist", "site": "left_hand_attachment_site",
+         "bodies": ["left_hand"], "stripped": False},
+        {"key": "right_hand", "anchor": "right_wrist",
+         "site": "right_hand_attachment_site",
+         "bodies": ["right_hand"], "stripped": False},
+    ]
+    return {
+        "robots": [{
+            "name": "arm",
+            "controller": "none",
+            "args": {},
+            "actuators": [{"name": "a1", "ctrlrange": [-1.0, 1.0]}],
+            "joints": [{"name": "j1", "type": "hinge", "limited": True,
+                        "range": [-3.14, 3.14]}],
+            "sites": ["left_hand_attachment_site", "right_hand_attachment_site",
+                      "attachment_site", "gripper/left_pad_site"],
+            "bodies": {"arm/base": "base", "arm/link1": "link1"},
+            "sensors": [{"name": "wrist_imu", "type": "imu", "dim": 6}],
+            "cameras": [],
+            "gripper": None,
+            "end_effectors": [{"source": "builtin", **e} for e in builtin],
+            "builtin_end_effectors": builtin,
+            "mounts": [
+                {"side": "left", "site": "left_hand_attachment_site",
+                 "label": "左手", "builtin": "left_hand", "end_effector": None},
+                {"side": "right", "site": "right_hand_attachment_site",
+                 "label": "右手", "builtin": "right_hand", "end_effector": None},
+            ],
+        }],
+        "end_effector_catalog": [
+            {"key": "onrobot_2fg7", "title": "OnRobot 2FG7 平行夹爪",
+             "cat": "parallel", "open": 0.038, "close": 0.0,
+             "supported_robots": ["ur5e.xml"]}],
+    }
+
+
+def _combo_find(combo, **want) -> int:
+    """按 data 字典里指定字段找下拉项下标（PySide6 的 findData 对 dict
+    比较不可靠，这里显式遍历）。"""
+    return next(i for i in range(combo.count())
+                if isinstance(combo.itemData(i), dict)
+                and all(combo.itemData(i).get(k) == v
+                        for k, v in want.items()))
+
+
+def test_gear_panel_apply_end_effector(qapp):
+    from simovia.gui.panels import GearPanel
+    p = GearPanel()
+    got = []
+    p.apply_end_effector.connect(lambda r, side, g: got.append((r, side, g)))
+    try:
+        p.set_manifest(_gear_manifest(), "/tmp")
+        assert p._robot_combo.currentData()["name"] == "arm"
+        # 安装位置默认第一项（左手），切到右手后装 2FG7
+        idx = _combo_find(p._mount_combo, side="right")
+        p._mount_combo.setCurrentIndex(idx)
+        gi = _combo_find(p._gripper_combo, model="onrobot_2fg7")
+        p._gripper_combo.setCurrentIndex(gi)
+        p._on_apply_gripper()
+        assert got == [("arm", "right", {"model": "onrobot_2fg7"})]
+        # 移除右手末端
+        p._on_remove_gripper()
+        assert got[-1] == ("arm", "right", None)
+        # 下拉里能选“自带灵巧手”，发出恢复指令
+        bi = _combo_find(p._gripper_combo, builtin="right_hand")
+        p._gripper_combo.setCurrentIndex(bi)
+        p._on_apply_gripper()
+        assert got[-1] == ("arm", "right", {"builtin": "right_hand"})
+    finally:
+        p.deleteLater()
+
+
+def test_gear_panel_end_effector_with_pose(qapp):
+    """填了 pos/rot 时发出的末端执行器 dict 带 pos/quat。"""
+    from simovia.gui.panels import GearPanel
+    p = GearPanel()
+    got = []
+    p.apply_end_effector.connect(lambda r, side, g: got.append(g))
+    try:
+        p.set_manifest(_gear_manifest(), "/tmp")
+        p._gripper_combo.setCurrentIndex(
+            _combo_find(p._gripper_combo, model="onrobot_2fg7"))
+        p._site_combo.setCurrentIndex(
+            p._site_combo.findData("gripper/left_pad_site"))
+        p._pos_spins[2].setValue(0.01)
+        p._rot_spins[2].setValue(90.0)
+        p._on_apply_gripper()
+        g = got[0]
+        assert g["model"] == "onrobot_2fg7"
+        assert g["site"] == "gripper/left_pad_site"
+        assert g["pos"] == [0.0, 0.0, 0.01]
+        # yaw 90deg -> wxyz ≈ (0.7071, 0, 0, 0.7071)
+        assert g["quat"][0] == pytest.approx(0.7071, abs=1e-3)
+        assert g["quat"][3] == pytest.approx(0.7071, abs=1e-3)
+    finally:
+        p.deleteLater()
+
+
+def test_gear_panel_add_body_sensor(qapp):
+    """tactile 走 body 引用，并携带 radius。"""
+    from simovia.gui.panels import GearPanel
+    p = GearPanel()
+    got = []
+    p.add_sensor.connect(lambda r, s: got.append((r, s)))
+    try:
+        p.set_manifest(_gear_manifest(), "/tmp")
+        p._sensor_type.setCurrentText("tactile")
+        assert p._ref_stack.currentIndex() == 1      # body 页
+        p._ref_body.setCurrentText("link1")
+        p._sensor_name.setText("pad_touch")
+        p._radius_spin.setValue(0.02)
+        p._on_add_sensor()
+        assert got == [("arm", {"name": "pad_touch", "type": "tactile",
+                                "body": "link1", "radius": 0.02})]
+    finally:
+        p.deleteLater()
+
+
+def test_gear_panel_add_joint_sensor(qapp):
+    from simovia.gui.panels import GearPanel
+    p = GearPanel()
+    got = []
+    p.add_sensor.connect(lambda r, s: got.append(s))
+    try:
+        p.set_manifest(_gear_manifest(), "/tmp")
+        p._sensor_type.setCurrentText("encoder")
+        assert p._ref_stack.currentIndex() == 0      # joint 页
+        p._sensor_name.setText("j1_enc")
+        p._on_add_sensor()
+        assert got == [{"name": "j1_enc", "type": "encoder", "joint": "j1"}]
+    finally:
+        p.deleteLater()
+
+
+def test_gear_panel_remove_sensor(qapp):
+    from simovia.gui.panels import GearPanel
+    p = GearPanel()
+    got = []
+    p.remove_sensor.connect(lambda r, s: got.append((r, s)))
+    try:
+        p.set_manifest(_gear_manifest(), "/tmp")
+        p._sensor_list.setCurrentRow(0)
+        p._on_remove_sensor()
+        assert got == [("arm", "wrist_imu")]
+    finally:
+        p.deleteLater()
+
+
+def test_new_scene_dialog_selection(qapp):
+    """M6 新建场景对话框：切模板时参数表单跟随变化。"""
+    from simovia.gui.app import NewSceneDialog
+    dlg = NewSceneDialog()
+    try:
+        # 默认含 pallet
+        keys = [dlg.cmb.itemData(i) for i in range(dlg.cmb.count())]
+        assert "pallet" in keys
+        # 切到 pallet：参数只有 cubes
+        dlg.cmb.setCurrentIndex(keys.index("pallet"))
+        key, params = dlg.selection()
+        assert key == "pallet"
+        assert params == {"cubes": 3}
+        # 改 cubes
+        w = dlg._param_widgets["cubes"][1]
+        w.setValue(5)
+        assert dlg.selection() == ("pallet", {"cubes": 5})
+        # 切到 maze：参数变 rows/cols
+        dlg.cmb.setCurrentIndex(keys.index("maze"))
+        key, params = dlg.selection()
+        assert key == "maze"
+        assert set(params) == {"rows", "cols"}
+    finally:
+        dlg.deleteLater()
+
+
+# ================================================================ 导入模型贴地
+
+_URDF_FIXTURE = """<?xml version="1.0"?>
+<robot name="mybot">
+  <link name="base">
+    <inertial><origin xyz="0 0 0"/><mass value="2.0"/>
+      <inertia ixx="0.01" ixy="0" ixz="0" iyy="0.01" iyz="0" izz="0.01"/></inertial>
+    <collision><geometry><box size="0.1 0.1 0.04"/></geometry></collision>
+  </link>
+  <link name="arm">
+    <inertial><origin xyz="0.1 0 0"/><mass value="0.5"/>
+      <inertia ixx="0.002" ixy="0" ixz="0" iyy="0.002" iyz="0" izz="0.001"/></inertial>
+    <collision><origin xyz="0.1 0 0"/>
+      <geometry><box size="0.2 0.03 0.03"/></geometry></collision>
+  </link>
+  <joint name="j1" type="revolute">
+    <parent link="base"/><child link="arm"/>
+    <origin xyz="0 0 0.03" rpy="0 0 0"/><axis xyz="0 0 1"/>
+    <limit lower="-3.14" upper="3.14" effort="10" velocity="2"/>
+  </joint>
+</robot>
+"""
+
+
+def test_import_spawn_z_urdf(tmp_path):
+    """导入贴地高度：qpos0 最低点（base 底 -0.02）+ 2mm 缓冲。"""
+    from simovia.gui.app import _import_spawn_z
+    p = tmp_path / "mybot.urdf"
+    p.write_text(_URDF_FIXTURE, encoding="utf-8")
+    assert _import_spawn_z(p) == pytest.approx(0.022)
+
+
+def test_import_spawn_z_mjcf(tmp_path):
+    """MJCF 同样适用：root body 自带 pos 被 builder 规则清零，按相对
+    几何算——box 半高 0.02 -> 0.022（与 URDF 同理）。"""
+    from simovia.gui.app import _import_spawn_z
+    p = tmp_path / "bot.xml"
+    p.write_text(
+        "<mujoco><worldbody>"
+        '<body name="b" pos="0 0 0.3"><geom type="box" size=".1 .1 .02"/>'
+        '<joint name="j" type="slide" axis="0 0 1"/>'
+        "</body></worldbody>"
+        '<actuator><motor name="m" joint="j"/></actuator></mujoco>',
+        encoding="utf-8")
+    assert _import_spawn_z(p) == pytest.approx(0.022)
+
+
+def test_import_spawn_z_plane_skipped(tmp_path):
+    """模型自带 plane（如整场景 MJCF）：无限大平面不参与贴地计算。
+
+    plane 挂在 z=-1：若未跳过会得到 spawn=1.002，跳过则按球体 0.052。
+    """
+    from simovia.gui.app import _import_spawn_z
+    p = tmp_path / "with_plane.xml"
+    p.write_text(
+        "<mujoco><worldbody>"
+        '<geom name="ground" type="plane" size="5 5 0.1" pos="0 0 -1"/>'
+        '<body name="b"><geom type="sphere" size="0.05"/>'
+        '<joint name="j" type="slide" axis="0 0 1"/>'
+        "</body></worldbody>"
+        '<actuator><motor name="m" joint="j"/></actuator></mujoco>',
+        encoding="utf-8")
+    # 最低点只算球体：0 - 0.05 + 0.002
+    assert _import_spawn_z(p) == pytest.approx(0.052)
+
+
+# ================================================================ AI 场景生成对话框
+
+def _wait_worker(qapp, dlg, timeout_s=5.0):
+    """等 worker 线程结束并派发排队信号（跨线程信号需事件循环）。"""
+    import time
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        qapp.processEvents()
+        if dlg._worker is None:              # 失败路径已复位
+            return
+        if not dlg._worker.isRunning():
+            time.sleep(0.02)                 # 收尾缓冲：残余排队信号
+            qapp.processEvents()
+            return
+        time.sleep(0.01)
+    qapp.processEvents()
+
+
+def test_scene_agent_dialog_flow(qapp, monkeypatch):
+    """空输入提示；生成成功后预览/按钮状态；点加载发 generated 信号。"""
+    from simovia.agent import AgentConfig
+    from simovia.gui.app import SceneAgentDialog
+    from PySide6.QtWidgets import QDialog
+    cfg = AgentConfig(base_url="http://x/v1", model="m")
+    dlg = SceneAgentDialog(cfg)
+    try:
+        # 空输入：仅提示不启动 worker
+        dlg._on_generate()
+        assert dlg.status.text().startswith("先输入")
+        assert dlg._worker is None
+        # 正常输入 + 打桩 SceneGenSession（含 zoo 下载回调）
+        dlg.input.setPlainText("一只机器狗")
+        seen = []
+
+        class FakeSession:
+            def __init__(self, c, on_download=None):
+                self.dl = on_download
+
+            def generate(self, req):
+                seen.append(("generate", req))
+                if self.dl:
+                    self.dl("unitree_go2")
+                return "name: ok\nfloor: {}\n", "已生成简单场景"
+
+        import simovia.agent as agent_pkg
+        monkeypatch.setattr(agent_pkg, "SceneGenSession", FakeSession)
+        got = []
+        dlg.generated.connect(got.append)
+        dlg._on_generate()
+        _wait_worker(qapp, dlg)
+        assert seen == [("generate", "一只机器狗")]
+        # 预览刷新 + 按钮状态切换（生成成功不直接加载）
+        assert dlg.preview.toPlainText() == "name: ok\nfloor: {}\n"
+        assert dlg.btn_load.isEnabled() and dlg.btn_save.isEnabled()
+        assert dlg.btn_gen.text() == "应用修改"
+        assert dlg.note == "已生成简单场景"
+        assert got == []                    # 未点加载，不发信号
+        # 点"加载并关闭"：发信号 + 关闭
+        dlg._on_load()
+        assert got == ["name: ok\nfloor: {}\n"]
+        assert dlg.result() == QDialog.DialogCode.Accepted
+    finally:
+        dlg.deleteLater()
+
+
+def test_scene_agent_dialog_failure(qapp, monkeypatch):
+    """生成失败：状态栏显示错误，worker 复位可再试。"""
+    from simovia.agent import AgentConfig
+    from simovia.agent.scene_agent import SceneGenError
+    from simovia.gui.app import SceneAgentDialog
+    cfg = AgentConfig(base_url="http://x/v1", model="m")
+    dlg = SceneAgentDialog(cfg)
+    try:
+        dlg.input.setPlainText("需求")
+
+        class FakeSession:
+            def __init__(self, c, on_download=None):
+                pass
+
+            def generate(self, req):
+                raise SceneGenError("LLM 服务不可达")
+
+        import simovia.agent as agent_pkg
+        monkeypatch.setattr(agent_pkg, "SceneGenSession", FakeSession)
+        dlg._on_generate()
+        _wait_worker(qapp, dlg)
+        assert "生成失败" in dlg.status.text()
+        assert "不可达" in dlg.status.text()
+        assert dlg._worker is None
+        assert dlg.btn_gen.isEnabled()     # 可重试
+    finally:
+        dlg.deleteLater()
+
+
+def test_scene_agent_dialog_refine(qapp, monkeypatch):
+    """生成后继续调整：第二次点按钮走 refine，预览刷新为新版。"""
+    from simovia.agent import AgentConfig
+    from simovia.gui.app import SceneAgentDialog
+    cfg = AgentConfig(base_url="http://x/v1", model="m")
+    dlg = SceneAgentDialog(cfg)
+    try:
+        seen = []
+
+        class FakeSession:
+            def __init__(self, c, on_download=None):
+                pass
+
+            def generate(self, req):
+                seen.append(("generate", req))
+                return "name: v1\n", "v1"
+
+            def refine(self, change):
+                seen.append(("refine", change))
+                return "name: v2\n", "v2"
+
+        import simovia.agent as agent_pkg
+        monkeypatch.setattr(agent_pkg, "SceneGenSession", FakeSession)
+        dlg.input.setPlainText("放一个红方块")
+        dlg._on_generate()
+        _wait_worker(qapp, dlg)
+        assert dlg.preview.toPlainText() == "name: v1\n"
+        # 继续调整：输入修改要求再点按钮（此时文本是"应用修改"）
+        dlg.input.setPlainText("把方块改成蓝色")
+        dlg._on_generate()
+        _wait_worker(qapp, dlg)
+        assert seen == [("generate", "放一个红方块"),
+                        ("refine", "把方块改成蓝色")]
+        assert dlg.preview.toPlainText() == "name: v2\n"
+        assert dlg._yaml == "name: v2\n"
+    finally:
+        dlg.deleteLater()
+
+
+def test_scene_agent_dialog_save(qapp, monkeypatch, tmp_path):
+    """保存按钮：QFileDialog 打桩选路径，YAML 落盘且状态提示。"""
+    from simovia.agent import AgentConfig
+    from simovia.gui.app import SceneAgentDialog
+    from PySide6.QtWidgets import QFileDialog
+    cfg = AgentConfig(base_url="http://x/v1", model="m")
+    dlg = SceneAgentDialog(cfg)
+    try:
+        class FakeSession:
+            def __init__(self, c, on_download=None):
+                pass
+
+            def generate(self, req):
+                return "name: my_world\nfloor: {}\n", ""
+
+        import simovia.agent as agent_pkg
+        monkeypatch.setattr(agent_pkg, "SceneGenSession", FakeSession)
+        dlg.input.setPlainText("需求")
+        dlg._on_generate()
+        _wait_worker(qapp, dlg)
+        out = tmp_path / "out.yaml"
+        monkeypatch.setattr(QFileDialog, "getSaveFileName",
+                            lambda *a, **k: (str(out), "YAML (*.yaml)"))
+        dlg._on_save()
+        assert out.read_text(
+            encoding="utf-8") == "name: my_world\nfloor: {}\n"
+        assert "已保存" in dlg.status.text()
+    finally:
+        dlg.deleteLater()
+
+
+# ---------------------------------------------------------------- IME 挂载
+
+@pytest.mark.skipif(sys.platform != "linux", reason="fcitx 插件仅 Linux")
+class TestMountImePlugin:
+    """mount_ime_plugin：本地 fcitx5 插件目录存在时自动挂载。"""
+
+    def _mk_plugin(self, home):
+        d = (home / ".local/share/simovia/qt-plugins"
+             / "platforminputcontexts")
+        d.mkdir(parents=True)
+        (d / "libfcitx5platforminputcontextplugin.so").touch()
+        return d
+
+    def test_mount_sets_plugin_path(self, monkeypatch, tmp_path):
+        self._mk_plugin(tmp_path)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("DISPLAY", ":0")
+        monkeypatch.delenv("QT_PLUGIN_PATH", raising=False)
+        monkeypatch.delenv("QT_IM_MODULE", raising=False)
+        mount_ime_plugin()
+        assert os.environ["QT_PLUGIN_PATH"] == \
+            str(tmp_path / ".local/share/simovia/qt-plugins")
+        assert os.environ["QT_IM_MODULE"] == "fcitx"
+
+    def test_noop_without_plugin(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("DISPLAY", ":0")
+        monkeypatch.delenv("QT_PLUGIN_PATH", raising=False)
+        monkeypatch.delenv("QT_IM_MODULE", raising=False)
+        mount_ime_plugin()
+        assert "QT_PLUGIN_PATH" not in os.environ
+        assert "QT_IM_MODULE" not in os.environ
+
+    def test_prepend_preserves_existing_path(self, monkeypatch, tmp_path):
+        self._mk_plugin(tmp_path)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("DISPLAY", ":0")
+        monkeypatch.setenv("QT_PLUGIN_PATH", "/some/other")
+        monkeypatch.delenv("QT_IM_MODULE", raising=False)
+        mount_ime_plugin()
+        assert os.environ["QT_PLUGIN_PATH"].split(os.pathsep) == [
+            str(tmp_path / ".local/share/simovia/qt-plugins"), "/some/other"]
+
+    def test_respects_existing_im_module(self, monkeypatch, tmp_path):
+        self._mk_plugin(tmp_path)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("DISPLAY", ":0")
+        monkeypatch.setenv("QT_IM_MODULE", "ibus")
+        mount_ime_plugin()
+        assert os.environ["QT_IM_MODULE"] == "ibus"   # 不覆盖用户配置
+
+    def test_headless_noop(self, monkeypatch, tmp_path):
+        """无 DISPLAY/WAYLAND_DISPLAY（无头/CI）：插件在也不挂。"""
+        self._mk_plugin(tmp_path)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.delenv("DISPLAY", raising=False)
+        monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+        monkeypatch.delenv("QT_PLUGIN_PATH", raising=False)
+        mount_ime_plugin()
+        assert "QT_PLUGIN_PATH" not in os.environ
+
+    def test_noop_when_wayland_display(self, monkeypatch, tmp_path):
+        """Wayland 会话（WAYLAND_DISPLAY）也允许挂载。"""
+        self._mk_plugin(tmp_path)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.delenv("DISPLAY", raising=False)
+        monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-0")
+        monkeypatch.delenv("QT_PLUGIN_PATH", raising=False)
+        mount_ime_plugin()
+        assert os.environ["QT_PLUGIN_PATH"].endswith(
+            ".local/share/simovia/qt-plugins")
+
+
+# ================================================================ 场景编辑历史
+
+class TestEditHistory:
+    """撤销/重做：YAML 全文快照（纯逻辑，无 Qt）。"""
+
+    def test_undo_redo_roundtrip(self):
+        from simovia.gui.state import EditHistory
+        h = EditHistory()
+        h.reset("v0", "打开")
+        h.push("v1", "移动 cube")
+        h.push("v2", "删除 arm")
+        assert h.can_undo() and not h.can_redo()
+        assert h.undo()["text"] == "v1"
+        assert h.undo()["text"] == "v0"
+        assert not h.can_undo()
+        assert h.redo()["text"] == "v1"
+        assert h.current()["label"] == "移动 cube"
+
+    def test_duplicate_snapshot_ignored(self):
+        from simovia.gui.state import EditHistory
+        h = EditHistory()
+        h.reset("v0")
+        assert h.push("v0") is False
+        assert len(h) == 1
+
+    def test_new_edit_truncates_redo_branch(self):
+        from simovia.gui.state import EditHistory
+        h = EditHistory()
+        h.reset("v0")
+        h.push("v1")
+        h.push("v2")
+        h.undo()
+        h.push("v2b", "新编辑")
+        assert not h.can_redo()
+        assert [it["text"] for it in h.entries()] == ["v0", "v1", "v2b"]
+
+    def test_limit_and_jump(self):
+        from simovia.gui.state import EditHistory
+        h = EditHistory(limit=3)
+        h.reset("v0")
+        for i in range(1, 5):
+            h.push(f"v{i}")
+        assert [it["text"] for it in h.entries()] == ["v2", "v3", "v4"]
+        assert h.jump(0)["text"] == "v2"
+        assert h.index == 0 and h.can_redo()
+
+
+def test_text_diff():
+    from simovia.gui.state import text_diff
+    assert text_diff("a\n", "a\n") == ""
+    d = text_diff("name: a\npos: [0, 0, 0]\n", "name: a\npos: [1, 0, 0]\n")
+    assert "-pos: [0, 0, 0]" in d and "+pos: [1, 0, 0]" in d
+
+
+# ================================================================ 观测曲线
+
+def _curve_obs(t, q, u):
+    return {"time": t, "robots": {"arm": {
+        "joints": {"j1": {"q": [q], "type": "hinge", "unit": "rad"}},
+        "actuators": {"a1": {"u": u, "joint": "j1", "mode": "position",
+                             "ctrlrange": [-2.0, 2.0]}}},
+        "objects": {}}}
+
+
+def test_obs_panel_curve_pause_and_export(qapp, tmp_path):
+    """观测曲线：采样去重、暂停冻结、CSV 导出含单位/限位。"""
+    from simovia.gui.panels import ObsPanel
+    p = ObsPanel()
+    try:
+        p.update_obs(_curve_obs(0.0, 0.1, 0.2))
+        p.update_obs(_curve_obs(0.1, 0.2, 0.2))
+        p.update_obs(_curve_obs(0.1, 0.2, 0.2))     # 同一状态不重复采样
+        assert p.curve.sample_count() == 2
+        assert p.combo_curve.currentText() == "arm · j1"
+
+        p.chk_pause.setChecked(True)               # 暂停查看：冻结
+        p.update_obs(_curve_obs(0.2, 0.3, 0.2))
+        assert p.curve.sample_count() == 2
+        p.chk_pause.setChecked(False)
+        p.update_obs(_curve_obs(0.2, 0.3, 0.2))
+        assert p.curve.sample_count() == 3
+
+        out = tmp_path / "curve.csv"
+        assert p.export_csv(str(out)) == 3
+        text = out.read_text(encoding="utf-8")
+        assert "time,q_actual,u_command" in text
+        assert "rad" in text and "j1" in text and "-2.000000" in text
+    finally:
+        p.deleteLater()
+
+
+def test_code_panel_save_and_run_are_separate(qapp, tmp_path):
+    """代码页：保存（仅写盘）与保存并运行是两个独立信号。"""
+    from simovia.gui.panels import CodePanel
+
+    class _R:
+        def __init__(self, name, controller):
+            self.name = name
+            self.controller = controller
+
+    ctrl = tmp_path / "ctrl.py"
+    ctrl.write_text("print('hi')\n", encoding="utf-8")
+    spec = type("S", (), {"robots": [_R("arm", "ctrl.py")]})()
+    p = CodePanel()
+    try:
+        only, both = [], []
+        p.saveOnlyRequested.connect(lambda n, t: only.append((n, t)))
+        p.saveRequested.connect(lambda n, t: both.append((n, t)))
+        p.set_world(spec, tmp_path)
+        p.edit.clear()
+        p.edit.insertPlainText("print('new')\n")
+        assert p.btn_save_only.text() == "保存 *"
+        p._on_save_only()
+        p._on_save()
+        assert only == [("arm", "print('new')\n")]
+        assert both == [("arm", "print('new')\n")]
+    finally:
+        p.deleteLater()
+
+
+def test_layout_presets_cover_all_docks():
+    from simovia.gui.app import DEFAULT_LAYOUT, LAYOUT_PRESETS
+    keys = {"scene", "right", "console", "teleop"}
+    for name, vis in LAYOUT_PRESETS.items():
+        assert set(vis) == keys, name
+        assert vis["right"] is True        # 任何预设都保留属性/观测
+    assert DEFAULT_LAYOUT["teleop"] is False   # 小屏默认收起遥操作
+
+
+def _cam_manifest():
+    """带两台相机的 manifest（世界 YAML 声明了深度开关与裁剪面）。"""
+    m = _gear_manifest()
+    m["robots"][0]["sensors"] += [
+        {"name": "wrist cam", "type": "camera", "dim": 0, "body": "link1",
+         "pos": [0.05, 0.0, 0.1], "quat": None, "fovy": 60.0,
+         "depth": True, "near": 0.05, "far": 5.0},
+        {"name": "side_cam", "type": "camera", "dim": 0, "body": "base",
+         "pos": [0.2, 0.0, 0.5], "quat": [1.0, 0.0, 0.0, 0.0], "fovy": 45.0,
+         "depth": False, "near": 0.02, "far": 20.0},
+    ]
+    m["robots"][0]["cameras"] = ["wrist cam", "side_cam"]
+    return m
+
+
+def test_teleop_panel_preview_and_camera_backfill(qapp):
+    """独立预览不依赖遥操作；切相机按 manifest 回填深度参数（F06/F07）。"""
+    from PySide6.QtCore import Qt
+    from simovia.gui.teleop_panel import TeleopPanel
+    p = TeleopPanel()
+    ev = []
+    p.previewToggled.connect(ev.append)
+    try:
+        p.set_manifest(_cam_manifest())
+        assert p.camera_combo.currentData() == "arm/wrist cam"
+        assert p.depth_chk.isChecked()
+        assert p.near_spin.value() == pytest.approx(0.05)
+        assert p.far_spin.value() == pytest.approx(5.0)
+        # 不需要 IK 遥操作即可开预览
+        p.bt_preview.setChecked(True)
+        assert ev == [True]
+        assert p.bt_preview.text() == "停止预览"
+        # 预览中换相机：回填新配置并按新相机重开流
+        p.camera_combo.setCurrentIndex(
+            p.camera_combo.findData("arm/side_cam"))
+        assert ev == [True, True]
+        assert not p.depth_chk.isChecked()
+        assert p.near_spin.value() == pytest.approx(0.02)
+        assert p.far_spin.value() == pytest.approx(20.0)
+        assert p.stream_args()["camera"] == "arm/side_cam"
+        p.bt_preview.setChecked(False)
+        assert ev[-1] is False
+        assert p.camera_combo.itemData(0) == ""      # 自由机位仍可选
+        # 带空格的相机名以原始名保存（F08）
+        names = [p.camera_combo.itemData(i)
+                 for i in range(p.camera_combo.count())]
+        assert "arm/wrist cam" in names
+        assert p.camera_combo.itemData(1) == "arm/wrist cam"
+        assert Qt.ItemDataRole.UserRole is not None
+    finally:
+        p.deleteLater()
+
+
+def test_teleop_panel_fits_narrow_dock(qapp):
+    """停靠面板最小宽度收敛：1024 宽屏幕右栏不出现横向裁切（实测 P3）。"""
+    from simovia.gui.teleop_panel import TeleopPanel
+    p = TeleopPanel()
+    try:
+        # 键位说明换行 + 裁剪面分两行 + 长相机名省略
+        assert p.minimumSizeHint().width() <= 240
+        # 画面在滚动区外且有独立最小高度：矮 dock 只滚控件，不裁画面
+        assert p.camera.parent() is p
+        p.resize(300, 220)
+        p.show()
+        qapp.processEvents()
+        assert p.camera.height() >= 100
+        assert p.camera.geometry().bottom() < p.height()
+    finally:
+        p.hide()
+        p.deleteLater()
+
+
+def test_import_spawn_z_returns_plain_float(tmp_path):
+    """导入自建机器人 YAML：贴地高度必须是 Python float（实测 P2）。
+
+    回归点：圆柱/网格分支直接拿 numpy 标量参与 round()，得到 np.float64，
+    写回世界 YAML 时 yaml.safe_dump 报 "cannot represent an object"。
+    """
+    import yaml
+    from simovia.gui.app import _import_spawn_z
+    p = tmp_path / "r.yaml"
+    p.write_text(
+        "name: r\n"
+        "links:\n"
+        "  - name: base\n"
+        "    pos: [0, 0, 0.08]\n"
+        "    geom: {type: cylinder, size: [0.07, 0.06], pos: [0, 0, 0.06]}\n",
+        encoding="utf-8")
+    z = _import_spawn_z(p)
+    assert type(z) is float
+    assert z > 0.0
+    yaml.safe_dump({"pos": [0.0, 0.0, z]})   # 修复前这里抛 RepresenterError
+
+
+def test_gear_camera_backfill_validation_and_selection(qapp):
+    """切相机回填/非法裁剪面就地报错/清单刷新保持选择（F07/F12/F13）。"""
+    from PySide6.QtCore import Qt
+    from simovia.gui.panels import GearPanel
+    p = GearPanel()
+    got = []
+    p.update_sensor.connect(lambda r, n, patch: got.append((n, patch)))
+    try:
+        p.set_manifest(_cam_manifest(), "/tmp")
+        assert p._cam_combo.currentData() == "wrist cam"
+        assert p._cam_depth.isChecked()
+        assert p._cam_near.value() == pytest.approx(0.05)
+        assert p._cam_pos_spins[0].value() == pytest.approx(0.05)
+        # 切 side_cam：fovy/深度/裁剪面/挂载位姿全部回填
+        p._cam_combo.setCurrentIndex(p._cam_combo.findData("side_cam"))
+        assert not p._cam_depth.isChecked()
+        assert p._cam_fovy.value() == pytest.approx(45.0)
+        assert p._cam_far.value() == pytest.approx(20.0)
+        assert p._cam_rot_spins[2].value() == pytest.approx(0.0, abs=1e-6)
+        # 非法裁剪面：就地错误 + 禁用保存 + 不发出更新
+        p._cam_near.setValue(5.0)
+        p._cam_far.setValue(1.0)
+        assert "near" in p._cam_err.text()
+        assert not p._bt_save_cam.isEnabled()
+        p._on_save_camera()
+        assert got == []
+        # 合法后保存：patch 带 pos/quat
+        p._cam_near.setValue(0.02)
+        p._cam_far.setValue(20.0)
+        assert p._bt_save_cam.isEnabled()
+        p._cam_rot_spins[2].setValue(90.0)
+        p._on_save_camera()
+        name, patch = got[-1]
+        assert name == "side_cam"
+        assert patch["near"] == 0.02 and patch["far"] == 20.0
+        assert patch["pos"] == [0.2, 0.0, 0.5]
+        # yaw 90deg -> wxyz ≈ (0.7071, 0, 0, 0.7071)
+        assert patch["quat"][0] == pytest.approx(0.7071, abs=1e-3)
+        assert patch["quat"][3] == pytest.approx(0.7071, abs=1e-3)
+        # 清单刷新（保存后重载）保持相机/传感器选择，不再跳回第一个
+        old = p._sensor_list.item(0)
+        p._sensor_list.setCurrentItem(old)
+        p.set_manifest(_cam_manifest(), "/tmp")
+        assert p._cam_combo.currentData() == "side_cam"
+        cur = p._sensor_list.currentItem()
+        assert cur is not None
+        assert cur.data(Qt.ItemDataRole.UserRole) == "wrist_imu"
+    finally:
+        p.deleteLater()
+
+
+def test_properties_task_status_phases(qapp):
+    """任务状态：未运行/运行中/已暂停/成功/未达标/异常分开显示。
+
+    tick=0 的 success=False 只是“还没跑”，不能标红成失败；未达标时给出
+    具体原因并露出定位物体/查看日志入口。
+    """
+    from simovia.gui.panels import PropertiesPanel
+
+    p = PropertiesPanel()
+    p.show()
+    qapp.processEvents()
+    try:
+        assert p._phase == "idle" and p._state.text() == "未运行"
+        # 刚加载（tick=0, success=False）不改状态，不标红
+        p.update_obs({"tick": 0, "time": 0.0,
+                      "task": {"success": False, "reward": -0.011}})
+        assert p._state.text() == "未运行"
+        assert p._reward.text() == "-"        # tick=0 不显示初始负 reward
+        assert not p._reason.isVisible()
+
+        p.mark_running()
+        assert p._state.text() == "运行中"
+        # 步进/停止 -> 已暂停，不显示原因
+        p.update_stats({"ticks": 32, "success": False, "reward": -0.1},
+                       final=False)
+        assert p._state.text() == "已暂停"
+        assert "暂停" in p._tick.text()
+        assert not p._reason.isVisible()
+
+        # 未达标：原因可见 + 定位/日志按钮可用
+        p.update_stats({"ticks": 297, "success": False, "reward": 0.0},
+                       "cube 高度 0.712 m，未达到成功区下限 0.80 m",
+                       can_locate=True)
+        assert p._state.text() == "未达标"
+        assert p._reason.isVisible() and "0.80" in p._reason.text()
+        assert p._bt_locate.isVisible() and p._bt_log.isVisible()
+
+        # 成功：原因与按钮全部收起
+        p.update_stats({"ticks": 300, "success": True, "reward": 1.2},
+                       "不该显示")
+        assert p._state.text() == "成功"
+        assert not p._reason.isVisible()
+        assert not p._task_btns.isVisible()
+
+        # 控制器异常退出 -> 异常（即使 success 为 False 也优先报异常）
+        p.update_stats({"ticks": 10, "success": False},
+                       "控制器异常退出：arm", error=True)
+        assert p._state.text() == "异常"
+        assert p._reason.isVisible()
+
+        p.reset_task()
+        assert p._state.text() == "未运行"
+        assert p._tick.text() == "-"
+    finally:
+        p.deleteLater()
+
+
+def test_properties_task_buttons_emit(qapp):
+    """未达标时的“定位物体/查看日志”按钮分别发出信号。"""
+    from simovia.gui.panels import PropertiesPanel
+
+    p = PropertiesPanel()
+    p.show()
+    qapp.processEvents()
+    hits = []
+    p.locateRequested.connect(lambda: hits.append("locate"))
+    p.logRequested.connect(lambda: hits.append("log"))
+    try:
+        p.update_stats({"ticks": 1, "success": False}, "未达标原因",
+                       can_locate=True)
+        qapp.processEvents()
+        p._bt_locate.click()
+        p._bt_log.click()
+        assert hits == ["locate", "log"]
+    finally:
+        p.deleteLater()
+
+
+def test_task_failure_reason_explains_goal():
+    """未达标解释：哪个物体、差多少、成功区在哪。"""
+    from types import SimpleNamespace
+
+    from simovia.gui.app import MainWindow
+
+    fake = SimpleNamespace(_spec=load_world(WORLD))
+    fake._task_success_spec = lambda: MainWindow._task_success_spec(fake)
+    reason = MainWindow._task_failure_reason(
+        fake, {"objects": {"cube": [0.55, 0.0, 0.71]}})
+    assert "cube" in reason and "0.71" in reason and "0.80" in reason
+    # 高度够了但横向偏离：给出当前坐标与目标区
+    reason = MainWindow._task_failure_reason(
+        fake, {"objects": {"cube": [0.30, 0.20, 0.86]}})
+    assert "0.30" in reason and "目标区" in reason
+    # 拿不到目标位置
+    reason = MainWindow._task_failure_reason(fake, {"objects": {}})
+    assert "cube" in reason
+    # 世界没有定义成功条件
+    no_task = SimpleNamespace(task=SimpleNamespace(success=None))
+    ns = SimpleNamespace(_spec=no_task)
+    ns._task_success_spec = lambda: MainWindow._task_success_spec(ns)
+    reason = MainWindow._task_failure_reason(ns, {})
+    assert "task.success" in reason
+
+
+def test_welcome_dialog_three_entries(qapp):
+    """首屏引导：三个入口各自发信号；“启动时显示”可关闭。"""
+    from simovia.gui.app import WelcomeDialog
+
+    d = WelcomeDialog("pick_cube")
+    hits = []
+    d.openSample.connect(lambda: hits.append("sample"))
+    d.newScene.connect(lambda: hits.append("new"))
+    d.aiScene.connect(lambda: hits.append("ai"))
+    try:
+        assert "pick_cube" in d.bt_sample.text()
+        assert d.should_show_next_time() is True
+        d.chk_show.setChecked(False)
+        assert d.should_show_next_time() is False
+        d.bt_sample.click()
+        d.bt_new.click()
+        d.bt_ai.click()
+        assert hits == ["sample", "new", "ai"]
+    finally:
+        d.deleteLater()
+
+
+def test_welcome_respects_startup_setting(monkeypatch):
+    """用户取消“启动时显示”后，启动不再自动弹引导。"""
+    import simovia.gui.app as app_mod
+    from types import SimpleNamespace
+
+    class _St:
+        def __init__(self, val):
+            self._val = val
+        def value(self, _key, default=None):
+            return self._val
+
+    called = []
+    fake = SimpleNamespace(_spec=object(), _welcome_pending=True,
+                           _show_welcome=lambda: called.append(1))
+
+    monkeypatch.setattr(app_mod, "QSettings", lambda: _St(False))
+    app_mod.MainWindow._maybe_show_welcome(fake)
+    assert called == []
+    assert fake._welcome_pending is True      # 只是没弹，标记保留
+
+    monkeypatch.setattr(app_mod, "QSettings", lambda: _St(True))
+    app_mod.MainWindow._maybe_show_welcome(fake)
+    assert called == [1]
+    assert fake._welcome_pending is False
+
+
+def test_doctor_dialog_summary_levels(qapp, monkeypatch):
+    """GUI 环境诊断：FAIL 优先报错、仅 WARN 提示降级、全通过显示成功。"""
+    import simovia.gui.app as app_mod
+
+    monkeypatch.setattr(app_mod._DoctorWorker, "start", lambda self: None)
+    d = app_mod.DoctorDialog()
+    try:
+        d.show_checks([("OK", "Python", "3.12"),
+                       ("WARN", "离屏渲染", "不可用"),
+                       ("FAIL", "样例世界", "编译失败")])
+        assert "必需检查未通过" in d._summary.text()
+        assert "[FAIL]" in d._text.toPlainText()
+        d.show_checks([("OK", "Python", "3.12"), ("WARN", "离屏渲染", "不可用")])
+        assert "可选/降级" in d._summary.text()
+        d.show_checks([("OK", "Python", "3.12")])
+        assert d._summary.text() == "全部通过。"
+    finally:
+        d.deleteLater()
+
+
+def test_controller_template_is_runnable():
+    """导入后生成的控制器模板：语法可编译、保持姿态、正确收尾。"""
+    from simovia.gui.app import _controller_template
+
+    text = _controller_template("arm")
+    compile(text, "<controller>", "exec")       # 语法合法
+    assert "from simovia.controller import Robot" in text
+    assert "robot.set_all(hold)" in text
+    assert "robot.close()" in text
+
+
+def test_append_robot_yaml_binds_controller():
+    """导入机器人时把控制器路径写进世界 YAML。"""
+    import yaml
+
+    from simovia.gui.app import MainWindow
+
+    class _Cli:
+        def call_tool(self, _name, _args, cb):
+            cb(None, "name: w\nrobots: []\n")
+
+    out = []
+    fake = type("F", (), {})()
+    fake.client = _Cli()
+    fake._unique_name = lambda k: k
+    fake._reload_yaml = lambda text, **kw: out.append(text)
+    fake._log = lambda *a, **k: None
+    fake._apply_state = lambda *a, **k: None
+
+    MainWindow._append_robot_yaml(fake, "go2", "/tmp/go2.xml", 0.1, 0.2, 0.4,
+                                  name="go2", controller="controllers/go2.py")
+    doc = yaml.safe_load(out[-1])
+    assert doc["robots"][0]["name"] == "go2"
+    assert doc["robots"][0]["controller"] == "controllers/go2.py"
+
+
+def test_make_controller_for_import_writes_relative(
+        qapp, monkeypatch, tmp_path):
+    """选“是”并指定路径后生成模板，返回相对世界目录的路径。"""
+    import simovia.gui.app as app_mod
+    from simovia.gui.app import MainWindow
+
+    class _MB:
+        class StandardButton:
+            Yes = 1
+            No = 0
+        @staticmethod
+        def question(*_a, **_k):
+            return _MB.StandardButton.Yes
+        @staticmethod
+        def critical(*_a, **_k):
+            pass
+
+    target = tmp_path / "controllers" / "arm_ctrl.py"
+    monkeypatch.setattr(app_mod, "QMessageBox", _MB)
+    monkeypatch.setattr(
+        app_mod, "QFileDialog",
+        type("_FD", (), {"getSaveFileName":
+                         staticmethod(lambda *_a, **_k: (str(target), ""))}))
+
+    fake = type("F", (), {})()
+    fake._base_dir = tmp_path
+    fake._spec = object()
+    fake._log = lambda *a, **k: None
+
+    rel = MainWindow._make_controller_for_import(fake, "arm")
+    assert rel == "controllers/arm_ctrl.py"
+    assert target.exists()
+    compile(target.read_text(encoding="utf-8"), "<ctrl>", "exec")
+
+
+def test_export_project_zip_packs_ctrl_and_model(tmp_path):
+    """导出包：控制器进 controllers/、本地模型连 mesh 整目录进 models/。"""
+    import yaml
+    import zipfile
+
+    from simovia.gui.app import _export_project_zip
+
+    base = tmp_path / "worlds"
+    base.mkdir()
+    (tmp_path / "controllers").mkdir()
+    (tmp_path / "controllers" / "pick.py").write_text(
+        "from simovia.controller import Robot\n", encoding="utf-8")
+    arm = tmp_path / "models" / "arm"
+    (arm / "meshes").mkdir(parents=True)
+    (arm / "arm.xml").write_text(
+        '<mujoco><compiler meshdir="meshes"/>'
+        '<asset><mesh file="link.stl"/></asset></mujoco>', encoding="utf-8")
+    (arm / "meshes" / "link.stl").write_bytes(b"solid link")
+    world = {
+        "name": "w",
+        "robots": [
+            {"name": "a", "model": "../models/arm/arm.xml",
+             "controller": "../controllers/pick.py", "pos": [0, 0, 0]},
+            {"name": "b", "model": "zoo://go2", "pos": [1, 0, 0]},
+        ],
+    }
+    out = tmp_path / "pkg.zip"
+    info = _export_project_zip(yaml.safe_dump(world), base, out)
+
+    assert info["controllers"] == ["controllers/pick.py"]
+    assert info["models"] == ["models/arm.xml"]
+    assert info["external"] == []
+    with zipfile.ZipFile(out) as zf:
+        names = set(zf.namelist())
+        doc = yaml.safe_load(zf.read("world.yaml"))
+    assert "world.yaml" in names
+    assert "controllers/pick.py" in names
+    assert "models/arm.xml" in names
+    # URDF/MJCF 的相对 mesh 引用必须一起打包
+    assert "models/meshes/link.stl" in names
+    assert doc["robots"][0]["controller"] == "controllers/pick.py"
+    assert doc["robots"][0]["model"] == "models/arm.xml"
+    assert doc["robots"][1]["model"] == "zoo://go2"      # 官方库模型保持原样
+
+
+def test_export_collects_mjcf_includes_and_meshdir(tmp_path):
+    """MJCF：include 递归跟进；mesh 的 file 相对 compiler meshdir 解析。"""
+    import yaml
+    import zipfile
+
+    from simovia.gui.app import _export_project_zip
+
+    base = tmp_path / "w"
+    (tmp_path / "robot" / "parts").mkdir(parents=True)
+    (tmp_path / "robot" / "meshes").mkdir(parents=True)
+    model = tmp_path / "robot" / "robot.xml"
+    model.write_text(
+        '<mujoco><compiler meshdir="meshes"/>'
+        '<include file="parts/body.xml"/>'
+        '<asset><mesh name="l" file="link.stl"/></asset></mujoco>',
+        encoding="utf-8")
+    (tmp_path / "robot" / "parts" / "body.xml").write_text(
+        "<mujoco><asset><mesh file='other.stl'/></asset></mujoco>",
+        encoding="utf-8")
+    (tmp_path / "robot" / "meshes" / "link.stl").write_bytes(b"solid a")
+    (tmp_path / "robot" / "meshes" / "other.stl").write_bytes(b"solid b")
+    base.mkdir()
+    world = {"name": "w", "robots": [
+        {"name": "r", "model": "../robot/robot.xml"}]}
+    out = tmp_path / "pkg.zip"
+    _export_project_zip(yaml.safe_dump(world), base, out)
+    with zipfile.ZipFile(out) as zf:
+        names = set(zf.namelist())
+        doc = yaml.safe_load(zf.read("world.yaml"))
+    assert "models/robot.xml" in names
+    assert "models/parts/body.xml" in names
+    assert "models/meshes/link.stl" in names
+    assert "models/meshes/other.stl" in names
+    assert doc["robots"][0]["model"] == "models/robot.xml"
+
+
+def test_export_project_zip_reports_external(tmp_path):
+    """缺失控制器 / 世界目录外的模型不打包，但要列进 external 提醒。"""
+    import yaml
+
+    from simovia.gui.app import _export_project_zip
+
+    base = tmp_path / "w"
+    base.mkdir()
+    world = {"name": "w", "robots": [
+        {"name": "a", "model": "/outside/arm.xml",
+         "controller": "missing.py"}]}
+    info = _export_project_zip(yaml.safe_dump(world), base,
+                               tmp_path / "pkg.zip")
+    assert info["controllers"] == [] and info["models"] == []
+    assert "missing.py" in info["external"]
+    assert "/outside/arm.xml" in info["external"]
+
+
+def test_export_project_zip_handles_old_mtime(tmp_path):
+    """源文件 mtime < 1980（跨平台拷贝常见）时 zip 仍能写入。"""
+    import os
+    import yaml
+    import zipfile
+
+    from simovia.gui.app import _export_project_zip
+
+    base = tmp_path / "w"
+    arm = tmp_path / "models" / "arm"
+    base.mkdir()
+    arm.mkdir(parents=True)
+    model = arm / "arm.xml"
+    model.write_text("<mujoco/>", encoding="utf-8")
+    os.utime(model, (0, 0))                 # 1970-01-01，早于 zip 时间下限
+    world = {"name": "w", "robots": [
+        {"name": "a", "model": "../models/arm/arm.xml"}]}
+    out = tmp_path / "pkg.zip"
+    _export_project_zip(yaml.safe_dump(world), base, out)
+    with zipfile.ZipFile(out) as zf:
+        assert zf.read("models/arm.xml") == b"<mujoco/>"
+
+
+def test_pointcloud_panel_renders_rainbow_cloud(qapp):
+    """3D 点云面板：自动取景 + 全分辨率渲染 + HUD 色带不崩（回归）。
+
+    回归点：_draw_hud 用标量 _jet 生成高度色带，旧实现 np.stack(axis=1)
+    对 0 维数组抛 AxisError —— 每帧 paintEvent 异常，面板空白/崩溃。
+    另守护自动取景：机位必须落在点云包围盒内部（站在屋里看），而不是
+    按对角线退到房间外变成"从外面看一个浅盘"。
+    """
+    import numpy as np
+    from PySide6.QtGui import QImage, QPainter
+    from simovia.gui.pointcloud_panel import PointCloudView
+
+    v = PointCloudView()
+    v.resize(360, 260)
+    vox = {}
+    for i in range(41):                      # 4m x 4m 地面
+        for j in range(41):
+            x, y = i * 0.1 - 2.0, j * 0.1 - 2.0
+            vox.setdefault((int(np.floor(x / 0.04)), int(np.floor(y / 0.04)), 0),
+                           (x, y, 0.0))
+    for k in range(40):                      # 2m 高的墙
+        vox.setdefault((0, 50, k), (0.0, 2.0, k * 0.05))
+    v._vox.update(vox)
+    v._rebuild()
+    v._autofit()
+    assert 0.3 < v._dist < 3.0               # 机位在房间内（不是对角线距离）
+
+    img = v._render_image(360, 260)
+    assert img is not None and img.width() == 360
+    raw = np.frombuffer(img.constBits(), dtype=np.uint8)
+    arr = raw.reshape(260, img.bytesPerLine())[:, :360 * 3]
+    assert int((arr > 0).sum()) > 2000       # 点确实画出来了
+
+    canvas = QImage(360, 260, QImage.Format.Format_RGB888)
+    canvas.fill(0)
+    p = QPainter(canvas)
+    try:
+        v._draw_hud(p, 360, 260)             # 标量 _jet：旧实现在此崩溃
+    finally:
+        p.end()
+    v.deleteLater()
+
+

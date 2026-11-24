@@ -1,0 +1,94 @@
+<!--
+  OnRobot 2FG7 平行夹爪（自包含装配入口，供 MjSpec.attach site= 挂到机械臂腕部）。
+
+  来源：OnRobot 官方 menagerie 资产（7 个 STL），改造点：
+  - root body gripper_base 位姿归零（去掉官方 scene 里的 pos/euler）——夹爪
+    相对机械臂 attachment_site 的全部安装变换收敛到 simovia/grippers.py 的
+    mount 表，每臂一份、纯数据可调。朝向 Rot_x(-90°)（手指由 body -y 转到
+    site +z 法兰法向），pos.z 按各臂法兰面位置 + base 后端面 0.1094 标定
+  - meshdir="assets" 相对本文件；attach 前由 builder 把 mesh 路径绝对化
+    （合并 spec 编译时相对路径会失效，与 zoo._write_demo_model 同款处理）
+
+  运动学：left/right 两条 slide（range 0~0.019）由 fixed tendon 耦合并联，
+  单个 position actuator gripper_act（ctrlrange 0~0.038：0.038 全开 / 0 闭合）。
+  attach 后全名 "<robot>/gripper/gripper_act"，控制器 robot.set 即可开合。
+-->
+<mujoco model="onrobot_2fg7">
+  <compiler angle="radian" coordinate="local" meshdir="assets" autolimits="true"/>
+
+  <asset>
+    <mesh name="base_mesh"             file="Base.stl"/>
+    <mesh name="left_finger_body"      file="LeftFingerBody.stl"/>
+    <mesh name="left_finger_pad"       file="LeftFingerPad.stl"/>
+    <mesh name="right_finger_body"     file="RightFingerBody.stl"/>
+    <mesh name="right_finger_pad"      file="RightFingerPad.stl"/>
+    <mesh name="left_finger_pad_coll"  file="LeftFingerPad_Coll.stl"/>
+    <mesh name="right_finger_pad_coll" file="RightFingerPad_Coll.stl"/>
+
+    <material name="polished_aluminium"
+              rgba="0.7 0.7 0.95 1"
+              specular="0.95" shininess="0.7" reflectance="0.28"/>
+    <material name="silicone_pad"
+              rgba="0.05 0.05 0.05 1"
+              specular="0.1" shininess="0.2" reflectance="0"/>
+  </asset>
+
+  <contact>
+    <exclude body1="gripper_base" body2="left_finger"/>
+    <exclude body1="gripper_base" body2="right_finger"/>
+  </contact>
+
+  <worldbody>
+    <!-- root 位姿归零：实际安装位姿由 grippers.py mount 表写入 attach frame -->
+    <body name="gripper_base">
+      <inertial pos="0 0 0" mass="0.95" diaginertia="0.002 0.002 0.002"/>
+      <geom type="mesh" mesh="base_mesh" material="polished_aluminium"/>
+      <!-- TCP 标识 site：指尖闭合中心，装配标定与控制器取点用 -->
+      <site name="gripper_tcp" pos="0 -0.028 0" size="0.003" rgba="0 1 1 0.4"/>
+
+      <body name="left_finger" pos="0.0125 0 0">
+        <inertial pos="0 0 0" mass="0.075" diaginertia="2e-5 2e-5 2e-5"/>
+        <joint name="left_slide" type="slide" axis="-1 0 0"
+               range="0 0.019" damping="5" frictionloss="0.2"/>
+        <geom type="mesh" mesh="left_finger_body"
+              material="polished_aluminium" contype="0" conaffinity="0"/>
+        <geom type="mesh" mesh="left_finger_pad"
+              material="silicone_pad" contype="0" conaffinity="0"/>
+        <geom type="mesh" mesh="left_finger_pad_coll"
+              rgba="1 1 1 0" friction="1.0 0.02 0.002"/>
+        <!-- 触觉挂点：覆盖左指板内侧面。注意 finger STL 经 mesh refquat 居中
+             后，指板几何在 finger body 系 -y 方向（非 STL 原始的 -z），pad
+             中心约 (-0.029,-0.028,0)，site 必须跟随该内置旋转 -->
+        <site name="left_pad_site" pos="-0.029 -0.028 0" size="0.01"
+              rgba="1 0 0 0.25"/>
+      </body>
+
+      <body name="right_finger" pos="-0.0125 0 0">
+        <inertial pos="0 0 0" mass="0.075" diaginertia="2e-5 2e-5 2e-5"/>
+        <joint name="right_slide" type="slide" axis="1 0 0"
+               range="0 0.019" damping="5" frictionloss="0.2"/>
+        <geom type="mesh" mesh="right_finger_body"
+              material="polished_aluminium" contype="0" conaffinity="0"/>
+        <geom type="mesh" mesh="right_finger_pad"
+              material="silicone_pad" contype="0" conaffinity="0"/>
+        <geom type="mesh" mesh="right_finger_pad_coll"
+              rgba="1 1 1 0" friction="1.0 0.02 0.002"/>
+        <!-- 触觉挂点：右指板内侧（与左指对称 +x），同样跟随 mesh refquat -->
+        <site name="right_pad_site" pos="0.029 -0.028 0" size="0.01"
+              rgba="1 0 0 0.25"/>
+      </body>
+    </body>
+  </worldbody>
+
+  <tendon>
+    <fixed name="gripper_tendon">
+      <joint joint="left_slide"  coef="1"/>
+      <joint joint="right_slide" coef="1"/>
+    </fixed>
+  </tendon>
+
+  <actuator>
+    <position name="gripper_act" tendon="gripper_tendon"
+              kp="100" ctrlrange="0 0.038"/>
+  </actuator>
+</mujoco>
