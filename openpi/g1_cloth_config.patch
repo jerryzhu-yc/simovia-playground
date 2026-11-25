@@ -1,0 +1,160 @@
+diff --git a/src/openpi/training/config.py b/src/openpi/training/config.py
+index 4ca47e1..ea45242 100644
+--- a/src/openpi/training/config.py
++++ b/src/openpi/training/config.py
+@@ -6,10 +6,11 @@ import dataclasses
+ import difflib
+ import logging
+ import pathlib
+-from typing import Any, Literal, Protocol, TypeAlias
++from typing import Any, ClassVar, Literal, Protocol, TypeAlias
+ 
+ import etils.epath as epath
+ import flax.nnx as nnx
++import numpy as np
+ from typing_extensions import override
+ import tyro
+ 
+@@ -556,6 +557,107 @@ class TrainConfig:
+             raise ValueError("Cannot resume and overwrite at the same time.")
+ 
+ 
++@dataclasses.dataclass(frozen=True)
++class _DecodeG1Images(_transforms.DataTransformFn):
++    """把 pinned lerobot 解码出的视频帧转成 openpi 约定。
++
++    lerobot（0cf8648）返回 torch Tensor (C,H,W) float32 [0,1]；openpi 的
++    ResizeImages / 模型输入要 numpy (H,W,C) uint8。state/actions 一并转
++    numpy，后续 Normalize / PadStatesAndActions / DeltaActions 都是按
++    numpy 语义写的（与 aloha_policy._decode_aloha 同一套转换）。
++
++    另外把数据集相机名映射成模型内部命名，并补齐 image_mask：pi0/pi05 的
++    Observation 固定要 base_0_rgb / left_wrist_0_rgb / right_wrist_0_rgb
++    三路和同名 mask（见 pi0_config.inputs_spec）。我们只有前两路，第三路
++    填黑图并置 mask=False；缺了 image_mask 会在 from_dict 里 KeyError。
++    """
++
++    CAMERA_MAP: ClassVar[tuple[tuple[str, str], ...]] = (
++        ("base_0_rgb", "cam_high"),
++        ("left_wrist_0_rgb", "cam_left_wrist"),
++        ("right_wrist_0_rgb", "cam_right_wrist"),
++    )
++
++    def __call__(self, data: dict) -> dict:
++        def convert_image(img):
++            img = np.asarray(img)
++            if np.issubdtype(img.dtype, np.floating):
++                img = (255 * img).astype(np.uint8)
++            if img.ndim == 3:
++                img = np.transpose(img, (1, 2, 0))  # CHW -> HWC
++            return img
++
++        if "image" in data:
++            in_images = {k: convert_image(v) for k, v in data["image"].items()}
++            base = in_images["cam_high"]
++            images = {"base_0_rgb": base}
++            masks = {"base_0_rgb": np.True_}
++            for dest, src in self.CAMERA_MAP[1:]:
++                if src in in_images:
++                    images[dest] = in_images[src]
++                    masks[dest] = np.True_
++                else:
++                    # 缺失的相机用黑图占位，mask=False 让模型忽略这一路
++                    images[dest] = np.zeros_like(base)
++                    masks[dest] = np.False_
++            data["image"] = images
++            data["image_mask"] = masks
++        for key in ("state", "actions"):
++            if key in data:
++                data[key] = np.asarray(data[key])
++        return data
++
++
++@dataclasses.dataclass(frozen=True)
++class LeRobotG1ClothDataConfig(DataConfigFactory):
++    """宇树 G1 叠布数据集（simovia 采集，LeRobot v2.1）。
++
++    16 维 state/action = 左 7 关节 + 左夹爪 + 右 7 关节 + 右夹爪；
++    2 路相机 = observation.images.cam_high / observation.images.cam_left_wrist。
++    关节用 delta 动作、夹爪保持绝对值（与 Aloha 配置同思路，7DoF 版）。
++    """
++
++    use_delta_joint_actions: bool = True
++    default_prompt: str | None = None
++
++    @override
++    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
++        repack_transforms = _transforms.Group(
++            inputs=[
++                _transforms.RepackTransform(
++                    {
++                        # 注意键名是 "image"（单数）：ModelTransformFactory 的
++                        # ResizeImages/模型输入读 data["image"]；Aloha 靠
++                        # AlohaInputs 做 images->image 改名，这里没有那个
++                        # 变换，所以在 repack 里直接用目标键名。
++                        "image": {
++                            "cam_high": "observation.images.cam_high",
++                            "cam_left_wrist": "observation.images.cam_left_wrist",
++                        },
++                        "state": "observation.state",
++                        "actions": "action",
++                        "prompt": "prompt",
++                    }
++                )
++            ]
++        )
++        data_transforms = _transforms.Group(inputs=[_DecodeG1Images()], outputs=[])
++        if self.use_delta_joint_actions:
++            delta_action_mask = _transforms.make_bool_mask(7, -1, 7, -1)
++            data_transforms = data_transforms.push(
++                inputs=[_transforms.DeltaActions(delta_action_mask)],
++                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
++            )
++        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
++        return dataclasses.replace(
++            self.create_base_config(assets_dirs, model_config),
++            repack_transforms=repack_transforms,
++            data_transforms=data_transforms,
++            model_transforms=model_transforms,
++            action_sequence_keys=("action",),
++        )
++
++
+ # Use `get_config` if you need to get a config by name in your code.
+ _CONFIGS = [
+     #
+@@ -762,6 +864,34 @@ _CONFIGS = [
+         num_train_steps=30_000,
+     ),
+     #
++    # Fine-tuning G1 cloth (simovia) config：4090 LoRA 微调。
++    #
++    TrainConfig(
++        name="pi05_g1_cloth_lora",
++        model=pi0_config.Pi0Config(
++            pi05=True,
++            action_horizon=10,
++            discrete_state_input=False,
++            paligemma_variant="gemma_2b_lora",
++            action_expert_variant="gemma_300m_lora",
++        ),
++        data=LeRobotG1ClothDataConfig(
++            repo_id="local/g1_cloth_teleop",
++            base_config=DataConfig(prompt_from_task=True),
++        ),
++        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
++        batch_size=32,
++        num_train_steps=20_000,
++        freeze_filter=pi0_config.Pi0Config(
++            pi05=True,
++            action_horizon=10,
++            discrete_state_input=False,
++            paligemma_variant="gemma_2b_lora",
++            action_expert_variant="gemma_300m_lora",
++        ).get_freeze_filter(),
++        ema_decay=None,
++    ),
++    #
+     # Fine-tuning Aloha configs.
+     #
+     # This is a test config that is used to illustate how train on a custom LeRobot dataset.
