@@ -31,7 +31,7 @@
 | `worlds/go2_trot_demo.yaml` | 基线世界，等价于模型库 `zoo.generate('unitree_go2', demo=True)` 的生成物 |
 | `worlds/go2_trot_sim2sim.yaml` | sim2sim 目标域世界，只改物理参数 |
 | `examples/sim2sim/mujoco_go2_trot.py` | 源端 runner：MuJoCo `MjSpec` 搭场景 + 原生 `mj_step`，支持 `--viewer` / `--video` / 轨迹日志 |
-| `site/public/assets/demos/go2_sim2sim.mp4` | 并排对比视频（1920×784，4.0 s，50 fps） |
+| `site/public/assets/demos/go2_sim2sim.mp4` | 并排对比视频（2560×1044，4.0 s，50 fps） |
 
 ## 复现流程
 
@@ -75,18 +75,18 @@ python -m simovia gui                                  # F5 运行 / F7 单步 /
 ```bash
 # 源端 62.5fps
 MUJOCO_GL=egl python examples/sim2sim/mujoco_go2_trot.py \
-    --ticks 250 --video /tmp/go2_src.mp4 --stride 1 --width 960 --height 720
+    --ticks 250 --video /tmp/go2_src.mp4 --stride 1 --width 1280 --height 960
 
 # 目标端 50fps PNG 帧
 MUJOCO_GL=egl python -m simovia run worlds/go2_trot_sim2sim.yaml \
     --record /tmp/go2_tgt --record-images --record-camera showcase \
-    --record-image-stride 1 --record-width 960 --record-height 720
+    --record-image-stride 1 --record-width 1280 --record-height 960
 ffmpeg -y -framerate 50 -i /tmp/go2_tgt/frames/frame_%06d.png \
     -c:v libx264 -crf 20 -pix_fmt yuv420p /tmp/go2_tgt.mp4
 
 # 统一到 50fps 后并排（标签/时间码按需改 drawtext）
 ffmpeg -y -i /tmp/go2_src.mp4 -i /tmp/go2_tgt.mp4 -filter_complex \
-  "[0:v]fps=50,scale=960:720[l];[1:v]fps=50,scale=960:720[r];[l][r]hstack=inputs=2[out]" \
+  "[0:v]fps=50,scale=1280:960[l];[1:v]fps=50,scale=1280:960[r];[l][r]hstack=inputs=2[out]" \
   -map "[out]" -c:v libx264 -crf 18 -pix_fmt yuv420p /tmp/go2_compare.mp4
 ```
 
@@ -103,7 +103,7 @@ ffmpeg -y -i /tmp/go2_src.mp4 -i /tmp/go2_tgt.mp4 -filter_complex \
 | `impratio` | 100 | 20 |
 | `gravity` | `[0, 0, -9.81]` | `[0, 0, -9.6]` |
 | 地面摩擦 | 0.8 | 0.6 |
-| 相机 `showcase` / 出生位姿 / 任务时长 | `pos [3.418, 2.428, 1.964]`、`quat [0.200893, 0.130462, 0.528783, 0.814254]`、`fovy 50`、`pos [0,0,0.45]`、4 s | 完全一致 |
+| 相机 `showcase` / 出生位姿 / 任务时长 | `pos [3.289, 3.618, 2.315]`、`quat [0.151214, 0.098413, 0.536518, 0.824377]`、`fovy 50`、`pos [0,0,0.45]`、4 s | 完全一致 |
 
 **控制律参数（`simovia/sim2sim/go2_trot.py`，与 zoo demo 原样同参）**
 
