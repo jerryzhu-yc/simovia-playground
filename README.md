@@ -14,6 +14,7 @@
 | `demo/so101-policy-eval` | SmolVLA 策略闭环 | 双相机 + 语言指令驱动 SO-101，31.25Hz chunk 推理（sim / sim2sim 双模式） |
 | `demo/g1-cloth` | G1 收拾毛毯遥操作 | PICO 手柄遥操作 G1 + 2F85 抓毯入盒，LeRobot 数据集采集/增强/回放/策略评测 |
 | `demo/g1-cloth-policy` | G1 收拾毛毯 π0.5 策略闭环 | 双相机 + 语言指令驱动 π0.5（pi05 + LoRA）自主抓毯入盒，31.25Hz chunk 推理 |
+| `demo/go2-sim2sim` | Go2 对角小跑 sim2sim | 同一份 CPG 控制律：MuJoCo 原生 mj_step vs Simovia，目标域只改控制周期/积分器/impratio/摩擦/重力 |
 | `demo/cloth-folding` | G1 叠毛毯 | G1 全身关节策略叠桌上的毛毯 |
 | `demo/fruit-sorting` | 视觉水果分拣 | 腕部 RGB + HSV 分割 + 手眼标定反投影，香蕉/苹果/葡萄分类入框（6/6） |
 | `demo/hand-eye` | 独立手眼标定 | AXB 手眼标定全流程：采样-求解-验证-落盘复用 |
